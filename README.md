@@ -157,6 +157,49 @@ governor that watches the fleet's own behaviour.
 
 ---
 
+## How it actually plays
+
+Town is a social hub — its `mobs` collection is always empty. Everything worth
+having is in dungeon rooms, reached through the lobby:
+
+```
+join town  →  walk to the trapdoor at (7,4)  →  lobby
+           →  l.solo.enter  →  l.reservation  →  dungeon room
+```
+
+Entry is refused with `too_far` unless the hero is standing on the trapdoor, so
+the bot BFS-paths there across the published town collision map first. Inside a
+dungeon there is no collision map, so it steps toward the nearest living mob in
+a straight line and lets the server correct it via `s.move.denied` rather than
+inventing walls it cannot see.
+
+### Signals
+
+Most of what matters arrives on the `s.*` namespace, not in room state:
+
+| Signal | Used for |
+| --- | --- |
+| `s.inv.sync` | the inventory — it is **not** in room state, and is sent once per run |
+| `s.loot.gold`, `s.combat.xp`, `s.loot.pxp` | ledger entries from real gains |
+| `s.combat.cdset` / `cdreduce` | actual ability cooldowns |
+| `s.combat.telegraph` | incoming attack — roll out of it |
+| `s.combat.death` | ours ends the run; anything else is a kill |
+| `s.move.denied` | the server's own position correction |
+
+Handlers attach *inside* the join, before it returns: the server pushes its
+opening state burst the instant the seat reservation is consumed, and a
+listener added afterwards misses all of it.
+
+### Survival
+
+A wipe forfeits the whole run's loot, so one more kill attempt costs far more
+than it looks:
+
+- below **45%** HP the bot stops picking fights
+- below **35%** it drinks, or retreats from the nearest threat if it cannot
+- a death exits the run rather than idling out the 20-minute budget
+- a run producing nothing for five minutes is abandoned
+
 ## Economy model
 
 Marketplace fee, from `/docs`: **10% for USDC listings, 5% for RELIC listings**,
@@ -271,6 +314,25 @@ The plain `➕` mint buttons still work and lead into the same job picker.
 Bulk assignment is scoped to the wallets from the most recent mint rather than
 the whole fleet — logging into wallets that already have a character only to
 discover that burns the auth quota, which is the scarcest resource here.
+
+New wallets are picked up automatically: the fleet rescans the key directory
+every minute and starts anything new, so a wallet minted from Telegram does not
+need a restart.
+
+### Rate limiting
+
+`/api/auth/verify` limits across the whole account set, not per wallet, and
+reconnects and restarts produce bursts no start schedule accounts for. Every
+login in the process funnels through one gate that serialises calls, spaces
+them 8s apart, widens when the server pushes back and eases off after success.
+Measured at 17 wallets: zero refusals, and the gate never had to widen.
+
+Only *login* is serialised. Once a wallet holds its token it plays fully in
+parallel — wallets do not take turns.
+
+**The gate is per-process**, so the CLI and the running service do not share
+it. Stop the service before a large CLI operation, or the server sees roughly
+double the rate.
 
 ### Telegram
 
