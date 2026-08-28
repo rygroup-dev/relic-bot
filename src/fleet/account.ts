@@ -116,6 +116,13 @@ export class AccountRunner {
    * and concluded there was nothing to fight — inside a dungeon full of mobs.
    */
   private dungeonState: unknown = null;
+  /** Set by `d.cleared`; the exit only opens once the floor is done. */
+  private floorCleared = false;
+  /** Set by `d.fountain.state` when a healing fountain is available. */
+  private fountainReady = false;
+  /** Set by `d.resurrection.state`. */
+  private resurrectionReady = false;
+  private descendSentAt = 0;
 
   /**
    * Every message from the dungeon room.
@@ -132,6 +139,27 @@ export class AccountRunner {
         kind: type === SIG.LOOT_GOLD ? 'gold' : 'loot',
         detail: type,
       });
+    }
+
+    // Dungeon progression signals. Without these the bot never leaves floor 1
+    // and never uses the two things that keep a run alive.
+    if (type === DUNGEON_IN.FLOOR_CLEARED) {
+      this.floorCleared = true;
+      this.note = 'floor cleared';
+    } else if (type === DUNGEON_IN.FOUNTAIN_STATE) {
+      this.fountainReady = readyFlag(payload);
+    } else if (type === DUNGEON_IN.RESURRECTION_STATE) {
+      this.resurrectionReady = readyFlag(payload);
+    } else if (type === DUNGEON_IN.DESCEND) {
+      // A successful descend resets the floor: new mobs, new exit.
+      this.floorCleared = false;
+      this.descendSentAt = 0;
+      this.log.info('descended to the next floor');
+    } else if (type === DUNGEON_IN.DESCEND_DENIED) {
+      const reason = String((payload as { reason?: unknown } | null)?.reason ?? 'unknown');
+      this.descendSentAt = 0;
+      if (reason === 'not_cleared') this.floorCleared = false;
+      this.log.debug(`descend denied: ${reason}`);
     }
 
     if (type === SIG.DEATH) {
@@ -359,6 +387,10 @@ export class AccountRunner {
       this.dungeonSessionId = room.sessionId;
       this.dungeonDumped = false;
       this.dungeonState = null;
+      this.floorCleared = false;
+      this.fountainReady = false;
+      this.resurrectionReady = false;
+      this.descendSentAt = 0;
 
       for (const type of VALUE_SIGNALS) {
         room.onMessage(type, (payload: unknown) => {
@@ -661,9 +693,18 @@ export class AccountRunner {
     room: { send: (t: string, p?: unknown) => void },
     sessionId: string | null,
   ): Promise<void> {
-    // A dead hero cannot act; hammering the server changes nothing.
+    // Dead, but the floor may offer a way back. Both are free to try and both
+    // are refused harmlessly if unavailable, which beats ending a run that
+    // still has loot in it.
     if (this.signals.dead) {
-      this.note = 'dead — waiting for the run to end';
+      if (this.resurrectionReady) {
+        this.note = 'dead — using the resurrection';
+        room.send(MSG.DUNGEON_RESURRECTION_USE, {});
+        this.resurrectionReady = false;
+        return;
+      }
+      this.note = 'dead — attempting revive';
+      room.send(MSG.REVIVE, {});
       return;
     }
 
@@ -687,6 +728,14 @@ export class AccountRunner {
       self.hp !== null && self.maxHp !== null && self.maxHp > 0 ? self.hp / self.maxHp : null;
 
     if (hpFrac !== null && hpFrac <= CRITICAL_HP_FRACTION) {
+      // A fountain is free healing and costs nothing to try.
+      if (this.fountainReady) {
+        this.note = `critical ${Math.round(hpFrac * 100)}% hp — drinking from the fountain`;
+        room.send(MSG.DUNGEON_FOUNTAIN_USE, {});
+        this.fountainReady = false;
+        return;
+      }
+
       const potion = this.inventory().find(
         (i) => i.consumable && i.restores === 'hp' && (i.quantity ?? 1) > 0 && i.itemId,
       );
@@ -739,6 +788,15 @@ export class AccountRunner {
       this.account.id,
       DEFAULT_COMBAT_TUNING,
     );
+    // A cleared floor is the whole point: deeper floors are where the better
+    // loot is, and standing on a finished one produces nothing at all.
+    if (this.floorCleared && Date.now() - this.descendSentAt > 15_000) {
+      this.descendSentAt = Date.now();
+      this.note = 'floor cleared — descending';
+      room.send(MSG.DESCEND_REQ, {});
+      return;
+    }
+
     if (targets.length === 0) {
       // Nothing in reach does not mean nothing to do. A dungeon floor is much
       // larger than the engage radius, so the bot has to close the distance
@@ -967,6 +1025,17 @@ function optional(r: Record<string, unknown>): Partial<SellableItem> {
   if (typeof r.slot === 'string') o.slot = r.slot;
   if (typeof r.rarity === 'string') o.rarity = r.rarity;
   return o;
+}
+
+/** Read a boolean-ish "is it available" flag from a state payload. */
+function readyFlag(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object') return false;
+  const r = payload as Record<string, unknown>;
+  for (const k of ['available', 'ready', 'active', 'charged', 'used']) {
+    const v = r[k];
+    if (typeof v === 'boolean') return k === 'used' ? !v : v;
+  }
+  return false;
 }
 
 function safeLabel(payload: unknown): string | null {
