@@ -192,3 +192,25 @@ describe('a notification names the wallet it is about', () => {
     }
   });
 });
+
+describe('a spreading outage is not deduplicated into silence', () => {
+  it('reports again when more wallets go quiet', () => {
+    const n = new Notifier({ dedupeWindowMs: 10 * 60_000 });
+    const now = Date.now();
+    // Five quiet, then twelve. Without a count in the key the second, worse
+    // report is suppressed and the operator never learns the real scale.
+    expect(n.shouldSend({ kind: 'silence', text: '5 quiet', dedupeKey: 'silence:5' }, now)).toBe(true);
+    expect(
+      n.shouldSend({ kind: 'silence', text: '12 quiet', dedupeKey: 'silence:12' }, now + 60_000),
+    ).toBe(true);
+  });
+
+  it('does not repeat an unchanged situation', () => {
+    const n = new Notifier({ dedupeWindowMs: 10 * 60_000 });
+    const now = Date.now();
+    expect(n.shouldSend({ kind: 'silence', text: '5 quiet', dedupeKey: 'silence:5' }, now)).toBe(true);
+    expect(
+      n.shouldSend({ kind: 'silence', text: '5 quiet', dedupeKey: 'silence:5' }, now + 60_000),
+    ).toBe(false);
+  });
+});

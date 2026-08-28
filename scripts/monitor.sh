@@ -23,7 +23,7 @@ ledger_rows() { wc -l < "$DATA/ledger.jsonl" 2>/dev/null || echo 0; }
 
 {
   echo "monitor started $(date -u +%FT%TZ)  samples=$SAMPLES interval=${INTERVAL}s"
-  echo "ts_utc            battles ledger dungeons deaths ratelimit parks wallets_producing"
+  echo "ts_utc            battles ledger dungeons deaths ratelimit parks producing silence recovered notifs"
 } > "$OUT"
 
 for i in $(seq 1 "$SAMPLES"); do
@@ -47,7 +47,13 @@ except Exception: pass
 print(len(s))
 PY
 )"
-  printf '%s  %7s %6s %8s %6s %9s %5s %s\n' "$TS" "$B" "$L" "$D" "$X" "$R" "$P" "$W" >> "$OUT"
+  # Notification-side counters: an operator needs to know the alarms fired,
+  # not just that the fleet was quiet.
+  S="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -c 'produced NOTHING')"
+  V="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -c 'producing again')"
+  N="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -cE 'Level up|Rare drop|Token gate opened|Producing nothing|Banned|Fleet stopped')"
+  printf '%s  %7s %6s %8s %6s %9s %5s %9s %7s %9s %6s\n' \
+    "$TS" "$B" "$L" "$D" "$X" "$R" "$P" "$W" "$S" "$V" "$N" >> "$OUT"
   [ "$i" -lt "$SAMPLES" ] && sleep "$INTERVAL"
 done
 echo "monitor finished $(date -u +%FT%TZ)" >> "$OUT"

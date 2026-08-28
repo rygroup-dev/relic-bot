@@ -26,6 +26,15 @@ export class Watchdog {
   private timer: NodeJS.Timeout | null = null;
   /** Accounts already alerted on, so we warn once per silent spell. */
   private alerted = new Set<string>();
+  /** Wallets that started producing again since the last check. */
+  private recovered: string[] = [];
+
+  /** Take the recovery list, so each recovery is reported once. */
+  drainRecovered(): string[] {
+    const out = this.recovered;
+    this.recovered = [];
+    return out;
+  }
 
   constructor(
     private readonly ledger: Ledger,
@@ -49,8 +58,11 @@ export class Watchdog {
           silentForMs: silentFor,
           battles: this.combat.totalBattles(id),
         });
-      } else {
+      } else if (this.alerted.has(id)) {
+        // It came back. Saying so closes the loop; otherwise the operator is
+        // left assuming the last alarm is still true.
         this.alerted.delete(id);
+        this.recovered.push(id);
       }
     }
     return out;

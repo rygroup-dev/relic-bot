@@ -32,6 +32,8 @@ export interface FleetAlert {
   kind: EventKind;
   text: string;
   accountId?: string;
+  /** Overrides the default kind+account dedupe key. */
+  dedupeKey?: string;
   /** Pre-rendered for chat, so a sink cannot accidentally drop the wallet. */
   formatted: string;
 }
@@ -46,6 +48,7 @@ export class Fleet {
 
   private runners: AccountRunner[] = [];
   private rescanTimer: NodeJS.Timeout | null = null;
+  private recoveryTimer: NodeJS.Timeout | null = null;
   /** Grades events so only what matters reaches Telegram. */
   private readonly notifier = new Notifier();
   private authFailures = 0;
@@ -108,7 +111,12 @@ export class Fleet {
   private async alert(a: Omit<FleetAlert, 'formatted'> & { formatted?: string }): Promise<void> {
     // Grade before sending: a channel full of routine noise stops being read,
     // and then a real alert goes unnoticed too.
-    const event = { kind: a.kind, text: a.text, ...(a.accountId ? { accountId: a.accountId } : {}) };
+    const event = {
+      kind: a.kind,
+      text: a.text,
+      ...(a.accountId ? { accountId: a.accountId } : {}),
+      ...(a.dedupeKey ? { dedupeKey: a.dedupeKey } : {}),
+    };
     if (!this.notifier.shouldSend(event)) {
       log.debug(`suppressed ${a.kind}: ${a.text.slice(0, 80)}`);
       return;
@@ -131,8 +139,14 @@ export class Fleet {
     );
     void this.alert({
       kind: 'silence',
+      // Key on how many wallets are affected, not just the kind. Without this
+      // a spreading outage is reported once at its smallest: five wallets go
+      // quiet and alert, twelve more go quiet two minutes later and are
+      // silently deduplicated away for ten minutes.
+      dedupeKey: `silence:${reports.length}`,
       text:
-        `${reports.length} account(s) producing NOTHING despite zero errors:\n` +
+        `${reports.length} of ${this.runners.length} wallets producing NOTHING ` +
+        `despite zero errors:\n` +
         lines.join('\n'),
     });
 
@@ -179,6 +193,19 @@ export class Fleet {
     }
 
     this.watchdog.start(() => this.runners.map((r) => r.account.id));
+
+    // Close the loop on silence alerts: an operator told a wallet went quiet
+    // should also be told when it came back, or the last alarm stands forever.
+    this.recoveryTimer = setInterval(() => {
+      const back = this.watchdog.drainRecovered();
+      if (back.length === 0) return;
+      void this.alert({
+        kind: 'character_created',
+        dedupeKey: `recovered:${back.join(',')}`,
+        text: `producing again: ${back.join(', ')}`,
+      });
+    }, 60_000);
+    this.recoveryTimer.unref?.();
 
     // Stagger starts so N sessions do not authenticate in the same second.
     for (const [i, runner] of this.runners.entries()) {
@@ -247,6 +274,8 @@ export class Fleet {
     this.running = false;
     if (this.rescanTimer) clearInterval(this.rescanTimer);
     this.rescanTimer = null;
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
+    this.recoveryTimer = null;
     this.watchdog.stop();
     await Promise.allSettled(this.runners.map((r) => r.stop()));
     log.info('fleet stopped');
