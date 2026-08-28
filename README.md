@@ -117,6 +117,27 @@ pick is used. **The LLM cannot invent an action, and cannot unlock a payment.**
 With `OTAK_ENABLED=false`, or with no API key, or with every provider down, the
 bot plays fully on heuristics.
 
+### Judging whether the brain earns its cost
+
+`/decisions` shows what Otak actually did, against what the heuristics would
+have chosen on their own:
+
+```
+🔀 the model changed the outcome
+✅ it agreed with the heuristics
+⚙️ decided without the model at all
+```
+
+The **override rate** is the honest measure. A model that almost never moves
+off the heuristic pick is spending tokens without changing behaviour, and that
+is shown rather than hidden behind a green light. Guardrail rejections — the
+model naming an option that was never offered — are counted separately; that
+number staying at zero is the evidence the guardrail works.
+
+Otak is only consulted when a wallet is actually playing and there are at least
+two candidates to rank. A parked fleet shows no model decisions however the
+switch is set.
+
 **Providers:** OpenAI · Anthropic · Sakana Fugu — with health checks and
 automatic fallback down the chain, then to pure heuristics. Configure at
 runtime from Telegram:
@@ -243,6 +264,14 @@ npm run ctl -- new --no-hero     # wallet only
 npm run ctl -- onboard           # give every character-less wallet a hero
 ```
 
+From Telegram, **👛 Wallets → ✨ Mint + job**: pick the class, pick how many,
+and each wallet is created, given a hero, and left ready to play in one action.
+The plain `➕` mint buttons still work and lead into the same job picker.
+
+Bulk assignment is scoped to the wallets from the most recent mint rather than
+the whole fleet — logging into wallets that already have a character only to
+discover that burns the auth quota, which is the scarcest resource here.
+
 ### Telegram
 
 Send `/menu` for a button interface: fleet status, holdings, wallets, token
@@ -263,7 +292,7 @@ means nobody, not everybody.
 
 ```bash
 npm install
-npm test          # 128 tests
+npm test          # 229 tests
 npm run typecheck
 npm run build
 ```
