@@ -67,6 +67,30 @@ export function createWallet(dir: string, id?: string): CreatedWallet {
   return { id: walletId, address: kp.publicKey.toBase58(), path };
 }
 
+/** Hard ceiling on one bulk generation request. */
+export const MAX_BULK_MINT = 10;
+
+/**
+ * Generate several wallets at once.
+ *
+ * Capped at MAX_BULK_MINT per call so a mis-tap cannot mint hundreds of keys,
+ * each of which is real key material the operator then has to back up. Every
+ * wallet is created individually, so a failure part-way still leaves the ones
+ * already written intact and usable.
+ */
+export function createWallets(dir: string, count: number): CreatedWallet[] {
+  const n = Math.floor(count);
+  if (!Number.isFinite(n) || n < 1) {
+    throw new WalletError('count must be at least 1');
+  }
+  if (n > MAX_BULK_MINT) {
+    throw new WalletError(`cannot mint more than ${MAX_BULK_MINT} wallets at once (asked for ${n})`);
+  }
+  const made: CreatedWallet[] = [];
+  for (let i = 0; i < n; i++) made.push(createWallet(dir));
+  return made;
+}
+
 /**
  * Import an existing secret key. Accepts a base58 string (Phantom export) or a
  * JSON array of 64 integers (solana-keygen). Validates before writing, so a

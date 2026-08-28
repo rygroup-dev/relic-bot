@@ -258,6 +258,61 @@ export function renderWallets(
   return out.join('\n');
 }
 
+/** Freshly minted wallets, with the backup warning that must accompany them. */
+export function renderMinted(
+  made: readonly { id: string; address: string }[],
+): string {
+  const out = [
+    `<b>✅ ${made.length} wallet${made.length === 1 ? '' : 's'} created</b>`,
+    '',
+  ];
+  for (const w of made) {
+    out.push(`🆕 <b>${esc(w.id)}</b>`, `   ${code(w.address)}`);
+  }
+  out.push(
+    '',
+    '───────────────',
+    'Keys are stored at <code>0600</code> on this server.',
+    '',
+    '⚠️ <b>Back them up now.</b> If this server is lost and you have no',
+    'copy, these wallets are gone permanently — nobody can recover them.',
+    '',
+    'Restart the bot to include them in the running fleet.',
+  );
+  return out.join('\n');
+}
+
+export interface CharacterRow {
+  classId: string;
+  icon: string;
+  owned: boolean;
+  unlocked: boolean;
+  name?: string;
+  level?: number;
+}
+
+/** Character roster with the free/gated split made explicit. */
+export function renderCharacters(wallet: string, rows: readonly CharacterRow[]): string {
+  const out = [`<b>🎭 Characters — ${esc(wallet)}</b>`, ''];
+  for (const r of rows) {
+    const state = r.owned
+      ? `✅ owned${r.name ? ` — <b>${esc(r.name)}</b>` : ''}${r.level ? ` lv${r.level}` : ''}`
+      : r.unlocked
+        ? '🆓 available'
+        : '🔒 locked — needs RELIC held';
+    out.push(`${r.icon} <b>${esc(r.classId)}</b> · ${state}`);
+  }
+  out.push(
+    '',
+    '───────────────',
+    '<i>🆓 classes can be created now. 🔒 classes reject with</i>',
+    '<i>token_required until the wallet holds enough RELIC.</i>',
+    '<i>The threshold is server-side, so this reflects what the</i>',
+    '<i>server actually reported for this wallet.</i>',
+  );
+  return out.join('\n');
+}
+
 export const HELP = [
   '<b>🎮 relic-bot</b>',
   '',
@@ -271,6 +326,7 @@ export const HELP = [
   'Use the buttons below, or these commands:',
   '',
   '<code>/status</code> — fleet overview',
+  '<code>/characters</code> — roster, and create new heroes',
   '<code>/wallets</code> — list, create, import, export',
   '<code>/holdings</code> — SOL and token balances',
   '<code>/sweep</code> — collect tokens into the main wallet',
@@ -278,4 +334,6 @@ export const HELP = [
   '<code>/gate</code> — token-gate state per wallet',
   '<code>/otak</code> — the LLM brain',
   '<code>/parks</code> — what is blocked, and why',
+  '',
+  '<i>Tip: a wallet needs a character before it can enter the world.</i>',
 ].join('\n');

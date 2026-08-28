@@ -20,6 +20,8 @@ import { AnthropicProvider } from '../otak/providers/anthropic.js';
 import { FuguProvider } from '../otak/providers/fugu.js';
 import {
   createWallet,
+  createWallets,
+  MAX_BULK_MINT,
   importWallet,
   exportWalletJson,
   fleetMembers,
@@ -29,6 +31,10 @@ import {
 } from '../wallet/manage.js';
 import { Treasury, type SweepReport, type FleetMember } from '../wallet/treasury.js';
 import { RELIC_MINT } from '../protocol/endpoints.js';
+import { CLASSES, CLASS_ICON, type ClassId } from '../protocol/messages.js';
+import { RestClient } from '../net/rest.js';
+import { AuthClient } from '../auth/client.js';
+import { loadAccount } from '../wallet/keystore.js';
 import * as ui from './ui.js';
 import { redact, logger } from '../log.js';
 
@@ -40,7 +46,8 @@ const EXPORT_TTL_S = 90;
 
 type Pending =
   | { kind: 'otak-key'; provider: ProviderName }
-  | { kind: 'import-wallet' };
+  | { kind: 'import-wallet' }
+  | { kind: 'character-name'; walletId: string; classId: ClassId };
 
 export interface TelegramOptions {
   token: string;
@@ -132,8 +139,11 @@ export class ControlBot {
       .text('👛 Wallets', 'nav:wallets')
       .text('🔒 Gate', 'nav:gate')
       .row()
+      .text('🎭 Characters', 'nav:chars')
       .text('🧠 Otak', 'nav:otak')
+      .row()
       .text('🅿️ Parks', 'nav:parks')
+      .text('🔄 Refresh', 'nav:menu')
       .row()
       .text('🧹 Sweep', 'tre:sweep:dry')
       .text('⛽ Fund gas', 'tre:fund:dry');
@@ -205,8 +215,11 @@ export class ControlBot {
       : '';
 
     const kb = new InlineKeyboard()
-      .text('➕ New wallet', 'wal:new')
-      .text('📥 Import', 'wal:import')
+      .text('➕ 1', 'wal:mint:1')
+      .text('➕ 5', 'wal:mint:5')
+      .text(`➕ ${MAX_BULK_MINT} (max)`, `wal:mint:${MAX_BULK_MINT}`)
+      .row()
+      .text('📥 Import key', 'wal:import')
       .row();
     if (members.length > 0) {
       kb.text('⭐ Set main', 'wal:main').text('🔑 Export key', 'wal:export').row();
@@ -268,6 +281,124 @@ export class ControlBot {
       }),
       ControlBot.backRow(kb),
     );
+  }
+
+  // ------------------------------------------------------------ characters --
+
+  /** A short-lived authenticated session for one wallet, for REST-only work. */
+  private async sessionFor(walletId: string) {
+    const rest = new RestClient(this.cfg.RELIC_BASE_URL);
+    const auth = new AuthClient(rest);
+    const account = loadAccount(join(this.cfg.RELIC_KEYS_DIR, `${walletId}.key`));
+    const session = await auth.login(account);
+    return { auth, session };
+  }
+
+  private async viewCharacterWallets(ctx: Context): Promise<void> {
+    let members: FleetMember[];
+    try {
+      members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
+    } catch {
+      members = [];
+    }
+    if (members.length === 0) {
+      await this.show(ctx, '<b>🎭 Characters</b>\n\nNo wallets yet — create one first.');
+      return;
+    }
+    const kb = new InlineKeyboard();
+    for (const m of members) kb.text(`👛 ${m.id}`, `chr:w:${m.id}`).row();
+    await this.show(
+      ctx,
+      '<b>🎭 Characters</b>\n\nPick a wallet to see its roster.\n\n' +
+        '<i>A wallet with no character cannot enter the world at all —</i>\n' +
+        '<i>the server refuses the join with no_character.</i>',
+      ControlBot.backRow(kb),
+    );
+  }
+
+  private async viewCharacters(ctx: Context, walletId: string): Promise<void> {
+    await this.show(ctx, '<i>Loading roster…</i>', new InlineKeyboard());
+    try {
+      const { auth, session } = await this.sessionFor(walletId);
+      const { characters, unlocks } = await auth.roster(session.token);
+
+      const owned = new Map(characters.map((c) => [String(c.classId ?? ''), c]));
+      const rows = CLASSES.map((classId) => {
+        const c = owned.get(classId);
+        const row: ui.CharacterRow = {
+          classId,
+          icon: CLASS_ICON[classId],
+          owned: Boolean(c),
+          unlocked: unlocks.length === 0 ? true : unlocks.includes(classId),
+        };
+        if (c?.name) row.name = c.name;
+        if (typeof c?.level === 'number') row.level = c.level;
+        return row;
+      });
+
+      const kb = new InlineKeyboard();
+      for (const r of rows) {
+        if (r.owned) continue;
+        kb.text(`${r.icon} Create ${r.classId}${r.unlocked ? '' : ' 🔒'}`, `chr:new:${walletId}:${r.classId}`).row();
+      }
+      kb.text('‹ Wallets', 'nav:chars').row();
+
+      await this.show(ctx, ui.renderCharacters(walletId, rows), ControlBot.backRow(kb));
+    } catch (err) {
+      await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
+    }
+  }
+
+  private async createCharacter(
+    ctx: Context,
+    walletId: string,
+    classId: ClassId,
+    name: string,
+  ): Promise<void> {
+    const trimmed = name.replace(/\s+/g, ' ').trim();
+    if (trimmed.length < 2 || trimmed.length > 20) {
+      await ctx.reply('Name must be 2–20 characters. Nothing was created.', {
+        parse_mode: 'HTML',
+        reply_markup: ControlBot.backRow(),
+      });
+      return;
+    }
+
+    try {
+      const { auth, session } = await this.sessionFor(walletId);
+      const created = await auth.createCharacter(session.token, classId, trimmed);
+      await ctx.reply(
+        [
+          `<b>✅ ${CLASS_ICON[classId]} ${ui.esc(classId)} created</b>`,
+          '',
+          `wallet: <b>${ui.esc(walletId)}</b>`,
+          `name: <b>${ui.esc(created?.name ?? trimmed)}</b>`,
+          '',
+          'Clear the park on this wallet and it will enter the world.',
+        ].join('\n'),
+        {
+          parse_mode: 'HTML',
+          reply_markup: ControlBot.backRow(
+            new InlineKeyboard()
+              .text('🔓 Clear parks', 'park:clear')
+              .text('🎭 Roster', `chr:w:${walletId}`),
+          ),
+        },
+      );
+    } catch (err) {
+      const m = (err as Error).message;
+      // Translate the server's own vocabulary rather than showing a raw code.
+      const friendly =
+        /token_required/.test(m)
+          ? '🔒 That class needs RELIC held on this wallet.'
+          : /classExists|exists/.test(m)
+            ? `You already have a ${classId} on this wallet.`
+            : ui.esc(m);
+      await ctx.reply(`⚠️ ${friendly}`, {
+        parse_mode: 'HTML',
+        reply_markup: ControlBot.backRow(new InlineKeyboard().text('🎭 Roster', `chr:w:${walletId}`)),
+      });
+    }
   }
 
   // ------------------------------------------------------------- treasury --
@@ -339,6 +470,7 @@ export class ControlBot {
     this.bot.command('wallets', (ctx) => this.viewWallets(ctx));
     this.bot.command('holdings', (ctx) => this.viewHoldings(ctx));
     this.bot.command('otak', (ctx) => this.viewOtak(ctx));
+    this.bot.command('characters', (ctx) => this.viewCharacterWallets(ctx));
     this.bot.command('sweep', (ctx) => this.runTreasury(ctx, 'sweep', false));
     this.bot.command('fund', (ctx) => this.runTreasury(ctx, 'fund', false));
 
@@ -353,6 +485,7 @@ export class ControlBot {
       if (where === 'wallets') return this.viewWallets(ctx);
       if (where === 'holdings') return this.viewHoldings(ctx);
       if (where === 'otak') return this.viewOtak(ctx);
+      if (where === 'chars') return this.viewCharacterWallets(ctx);
     });
 
     this.bot.callbackQuery('park:clear', async (ctx) => {
@@ -370,23 +503,21 @@ export class ControlBot {
     });
 
     // ---- wallets ----------------------------------------------------------
-    this.bot.callbackQuery('wal:new', async (ctx) => {
-      await ctx.answerCallbackQuery();
+    this.bot.callbackQuery(/^wal:mint:(\d+)$/, async (ctx) => {
+      const n = Number(ctx.match![1]);
+      await ctx.answerCallbackQuery({ text: `minting ${n}…` });
       try {
-        const w = createWallet(this.cfg.RELIC_KEYS_DIR);
+        const made = n === 1
+          ? [createWallet(this.cfg.RELIC_KEYS_DIR)]
+          : createWallets(this.cfg.RELIC_KEYS_DIR, n);
         await this.show(
           ctx,
-          [
-            '<b>✅ Wallet created</b>',
-            '',
-            `id: <b>${ui.esc(w.id)}</b>`,
-            `address: ${ui.code(w.address)}`,
-            '',
-            'The key is stored at <code>0600</code> on this server.',
-            '<b>Back it up</b> — export it below and keep it somewhere safe.',
-            'If the server is lost and you have no backup, the wallet is gone.',
-          ].join('\n'),
-          ControlBot.backRow(new InlineKeyboard().text('👛 Wallets', 'nav:wallets')),
+          ui.renderMinted(made),
+          ControlBot.backRow(
+            new InlineKeyboard()
+              .text('👛 Wallets', 'nav:wallets')
+              .text('🔑 Back up keys', 'wal:export'),
+          ),
         );
       } catch (err) {
         await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
@@ -501,6 +632,32 @@ export class ControlBot {
       }
     });
 
+    // ---- characters -------------------------------------------------------
+    this.bot.callbackQuery(/^chr:w:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      return this.viewCharacters(ctx, ctx.match![1]!);
+    });
+
+    this.bot.callbackQuery(/^chr:new:([^:]+):(.+)$/, async (ctx) => {
+      const walletId = ctx.match![1]!;
+      const classId = ctx.match![2] as ClassId;
+      await ctx.answerCallbackQuery();
+      this.pending.set(ctx.chat!.id, { kind: 'character-name', walletId, classId });
+      await this.show(
+        ctx,
+        [
+          `<b>${CLASS_ICON[classId] ?? '🎭'} New ${ui.esc(classId)} — ${ui.esc(walletId)}</b>`,
+          '',
+          'Send the hero name as your next message.',
+          '',
+          '2–20 characters, letters, numbers and spaces.',
+          '',
+          '⚠️ <b>The name is permanent.</b> The game does not allow renaming.',
+        ].join('\n'),
+        ControlBot.backRow(),
+      );
+    });
+
     // ---- otak -------------------------------------------------------------
     this.bot.callbackQuery('otak:toggle', async (ctx) => {
       this.rebuildProviders();
@@ -578,6 +735,11 @@ export class ControlBot {
           ].join('\n'),
           { parse_mode: 'HTML', reply_markup: ControlBot.backRow(new InlineKeyboard().text('🧠 Otak', 'nav:otak')) },
         );
+        return;
+      }
+
+      if (p.kind === 'character-name') {
+        await this.createCharacter(ctx, p.walletId, p.classId, text);
         return;
       }
 
@@ -660,6 +822,7 @@ export class ControlBot {
       { command: 'sweep', description: 'Collect tokens into the main wallet' },
       { command: 'fund', description: 'Top up wallets low on gas' },
       { command: 'gate', description: 'Token-gate state' },
+      { command: 'characters', description: 'Roster and hero creation' },
       { command: 'otak', description: 'The LLM brain' },
       { command: 'parks', description: 'What is blocked, and why' },
     ]);

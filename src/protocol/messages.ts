@@ -106,6 +106,35 @@ export const ROOM = {
 export type RoomName = (typeof ROOM)[keyof typeof ROOM];
 
 /**
+ * Playable classes, from the character-select scene in the production bundle
+ * (`fg = [{classId:"hunter"}, ...]`).
+ *
+ * Which of these a wallet may actually use is decided by the `unlocks` array
+ * returned from /api/characters, and selecting a gated character throws
+ * `token_required`. That mapping is server-side, so it is read at runtime and
+ * never hardcoded here.
+ */
+export const CLASSES = [
+  'hunter',
+  'mage',
+  'necromancer',
+  'knight',
+  'assassin',
+  'rogue',
+] as const;
+
+export type ClassId = (typeof CLASSES)[number];
+
+export const CLASS_ICON: Record<ClassId, string> = {
+  hunter: '🏹',
+  mage: '🔮',
+  necromancer: '💀',
+  knight: '🛡️',
+  assassin: '🗡️',
+  rogue: '🎭',
+};
+
+/**
  * Server-side refusal / disconnect reasons observed in the client's error
  * handling. `classify` maps a raw error string onto how the fleet must react.
  *

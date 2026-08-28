@@ -130,7 +130,37 @@ export class AuthClient {
     return res?.characters ?? [];
   }
 
-  async selectCharacter(token: string, characterId: string): Promise<void> {
-    await this.rest.post(EP.CHARACTER_SELECT, { characterId }, token);
+  /** Full roster plus the unlock list that decides which classes are usable. */
+  async roster(token: string): Promise<{ characters: Character[]; unlocks: string[] }> {
+    const res = await this.rest.get<{ characters?: Character[]; unlocks?: string[] }>(
+      EP.CHARACTERS,
+      token,
+    );
+    return { characters: res?.characters ?? [], unlocks: res?.unlocks ?? [] };
+  }
+
+  /**
+   * Create a character. The name is PERMANENT — the game says so in its own UI —
+   * so this is only ever called on an explicit operator instruction.
+   *
+   * Server errors seen in the client: `exists` / `classExists` when the wallet
+   * already owns that class.
+   */
+  async createCharacter(token: string, classId: string, name: string): Promise<Character | null> {
+    const res = await this.rest.post<{ character?: Character; error?: string }>(
+      EP.CHARACTER,
+      { classId, name },
+      token,
+    );
+    if (res?.error) throw new Error(res.error);
+    return res?.character ?? null;
+  }
+
+  /**
+   * Select a character. A gated class rejects with `token_required`, which is
+   * the RELIC-holding requirement surfacing — not a bug.
+   */
+  async selectCharacter(token: string, userId: string): Promise<void> {
+    await this.rest.post(EP.CHARACTER_SELECT, { userId }, token);
   }
 }
