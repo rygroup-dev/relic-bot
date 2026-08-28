@@ -10,6 +10,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { Account } from '../wallet/keystore.js';
 import { AuthClient, BannedError, type Session } from '../auth/client.js';
 import { ZoneConnection, zoneEndpoint } from '../net/zone.js';
+import { enterSoloDungeon, EntryDeniedError, DUNGEON_IN, VALUE_SIGNALS } from '../net/lobby.js';
 import { MSG, ROOM } from '../protocol/messages.js';
 import { free, ParkRegistry } from '../safety/park.js';
 import { Ledger, CombatMemory } from '../safety/ledger.js';
@@ -23,6 +24,7 @@ import {
   DEFAULT_COMBAT_TUNING,
 } from '../game/combat.js';
 import { readEntities, readSelf, describeUnknownState, type SelfView } from '../game/state.js';
+import { loadWorldMap, dungeonEntrance, findPath, type Cell } from '../game/world.js';
 import { logger, type Logger } from '../log.js';
 import type { Config } from '../config.js';
 
@@ -68,6 +70,8 @@ export class AccountRunner {
   private note = '';
   private stopping = false;
   private gateStatus: GateStatus | null = null;
+  /** Monotonic move sequence, as the client sends with every i.move. */
+  private moveSeq = 0;
 
   constructor(
     readonly account: Account,
@@ -196,6 +200,10 @@ export class AccountRunner {
     this.zone = zone;
     this.phase = 'playing';
 
+    // Town is a social hub: its `mobs` collection is always empty (verified
+    // live). Staying here produces nothing, so head into a dungeon.
+    await this.runDungeon();
+
     let ticks = 0;
     while (!this.stopping && !left && zone.connected) {
       await this.tick();
@@ -205,6 +213,173 @@ export class AccountRunner {
 
     await zone.leave(true);
     this.zone = null;
+  }
+
+  /**
+   * Enter a solo dungeon and play it out.
+   *
+   * Routed through free() so a denied entry parks instead of looping, and so a
+   * fleet-wide park stops every wallet from queueing for runs at once.
+   */
+  private async runDungeon(): Promise<void> {
+    if (!this.session) return;
+
+    // Entry is refused with `too_far` unless the hero is on the trapdoor, so
+    // walk there first rather than requesting from the spawn point.
+    const at = await this.walkToDungeonEntrance();
+    const self = readSelf(this.latestState, this.zone?.sessionId ?? null);
+    const atCol = at?.col ?? self.pos?.x ?? 0;
+    const atRow = at?.row ?? self.pos?.y ?? 0;
+
+    await free(this.d.parks, this.account.id, 'dungeon', async () => {
+      let entry;
+      try {
+        entry = await enterSoloDungeon({
+          endpoint: zoneEndpoint(this.d.cfg.RELIC_BASE_URL),
+          token: this.session!.token,
+          atCol,
+          atRow,
+          startDepth: 1,
+        });
+      } catch (err) {
+        if (err instanceof EntryDeniedError) {
+          // A denial is data, not a crash: record why and let the park decide.
+          this.note = `dungeon entry denied: ${err.reason}`;
+          this.log.warn(this.note);
+          throw new Error(`dungeon_denied_${err.reason}`);
+        }
+        throw err;
+      }
+
+      const { room, client } = entry;
+      this.note = 'in dungeon';
+      let finished = false;
+
+      for (const type of VALUE_SIGNALS) {
+        room.onMessage(type, (payload: unknown) => {
+          this.d.ledger.append({
+            accountId: this.account.id,
+            kind: type === DUNGEON_IN.FLOOR_CLEARED ? 'kill' : 'loot',
+            detail: safeLabel(payload) ?? type,
+          });
+        });
+      }
+      room.onMessage(DUNGEON_IN.EXIT, () => {
+        finished = true;
+      });
+      room.onMessage(DUNGEON_IN.SUMMARY, (p: unknown) => {
+        this.log.info(`run summary: ${JSON.stringify(p).slice(0, 200)}`);
+        finished = true;
+      });
+      room.onStateChange((st) => {
+        this.latestState = st;
+      });
+      room.onLeave(() => {
+        finished = true;
+      });
+
+      const started = Date.now();
+      while (!this.stopping && !finished && Date.now() - started < 20 * 60_000) {
+        await this.dungeonTick(room);
+        await this.tempo();
+      }
+
+      await room.leave(true).catch(() => {});
+      void client;
+      this.note = 'dungeon run ended';
+    });
+  }
+
+  /**
+   * Walk to the town's dungeon entrance.
+   *
+   * Returns the cell actually reached, or null if the map or a route could not
+   * be found — in which case entry is still attempted from where we stand, so a
+   * map-loading failure degrades rather than blocks.
+   */
+  private async walkToDungeonEntrance(): Promise<Cell | null> {
+    const zone = this.zone;
+    if (!zone?.connected) return null;
+
+    const map = await loadWorldMap(this.d.cfg.RELIC_BASE_URL, 'town');
+    if (!map) return null;
+
+    const target = dungeonEntrance(map);
+    if (!target) {
+      this.log.warn('town map has no dungeonEntrance marker');
+      return null;
+    }
+
+    const self = readSelf(this.latestState, zone.sessionId);
+    if (!self.pos) {
+      // Position unknown: ask to move straight to the trapdoor and hope the
+      // server pathfinds. Worst case it refuses and we report `too_far`.
+      zone.send(MSG.MOVE, { col: target.col, row: target.row, seq: ++this.moveSeq });
+      await sleep(3_000);
+      return target;
+    }
+
+    const from: Cell = { col: Math.round(self.pos.x), row: Math.round(self.pos.y) };
+    const path = findPath(map, from, target);
+    if (!path) {
+      this.log.warn(`no route from (${from.col},${from.row}) to the dungeon entrance`);
+      return null;
+    }
+
+    this.note = `walking to the dungeon entrance (${path.length} steps)`;
+    for (const step of path) {
+      if (this.stopping || !zone.connected) break;
+      zone.send(MSG.MOVE, { col: step.col, row: step.row, seq: ++this.moveSeq });
+      // Roughly the client's own step cadence; moving faster invites a desync.
+      await sleep(220);
+    }
+    await sleep(1_200);
+    return target;
+  }
+
+  /** One decision inside a dungeon, where the mobs actually are. */
+  private async dungeonTick(room: { send: (t: string, p?: unknown) => void }): Promise<void> {
+    const entities = readEntities(this.latestState);
+    const self = readSelf(this.latestState, null);
+
+    const loot = lootCandidates(self, entities);
+    if (loot.length > 0) {
+      const d = await this.d.otak.decide({
+        domain: 'economy',
+        situation: `${loot.length} drop(s) in reach`,
+        candidates: loot,
+      });
+      const parsed = d.chosenId ? parseCandidateId(d.chosenId) : null;
+      if (parsed) {
+        room.send(MSG.LOOT_PICKUP, { id: parsed.target });
+        return;
+      }
+    }
+
+    const targets = combatCandidates(
+      self,
+      entities,
+      this.d.combat,
+      this.account.id,
+      DEFAULT_COMBAT_TUNING,
+    );
+    if (targets.length === 0) {
+      this.note = 'dungeon: nothing engageable';
+      return;
+    }
+
+    const d = await this.d.otak.decide({
+      domain: 'combat',
+      situation: `hp=${self.hp ?? '?'}/${self.maxHp ?? '?'}, ${targets.length} in reach`,
+      candidates: targets,
+    });
+    const parsed = d.chosenId ? parseCandidateId(d.chosenId) : null;
+    if (!parsed) {
+      this.note = `otak declined: ${d.reasoning}`;
+      return;
+    }
+    this.note = `attacking ${parsed.target} (${d.source})`;
+    room.send(MSG.ATTACK, { targetId: parsed.target });
   }
 
   /** Server messages we can attribute value to. */

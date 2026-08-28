@@ -36,6 +36,8 @@ import { RestClient } from '../net/rest.js';
 import { AuthClient } from '../auth/client.js';
 import { loadAccount } from '../wallet/keystore.js';
 import { generateName } from '../game/names.js';
+import { onboardBatch } from '../game/onboard.js';
+import { loadFleet } from '../wallet/keystore.js';
 import { readRelicBalance } from '../economy/gate.js';
 import * as ui from './ui.js';
 import { redact, logger } from '../log.js';
@@ -364,6 +366,42 @@ export class ControlBot {
     }
   }
 
+  /** Give every character-less wallet the same job, each with its own name. */
+  private async bulkOnboard(ctx: Context, classId: ClassId): Promise<void> {
+    try {
+      const accounts = loadFleet(this.cfg.RELIC_KEYS_DIR);
+      const rest = new RestClient(this.cfg.RELIC_BASE_URL);
+      const auth = new AuthClient(rest);
+
+      let last = 0;
+      const results = await onboardBatch(auth, accounts, {
+        classId,
+        taken: new Set<string>(),
+        onProgress: async (done, total) => {
+          if (Date.now() - last < 3000 && done !== total) return;
+          last = Date.now();
+          await this.show(
+            ctx,
+            `<b>${CLASS_ICON[classId]} Creating ${ui.esc(classId)}s…</b>\n\n${done}/${total}`,
+            new InlineKeyboard(),
+          ).catch(() => {});
+        },
+      });
+
+      await this.show(
+        ctx,
+        ui.renderOnboard(results),
+        ControlBot.backRow(
+          new InlineKeyboard()
+            .text('🎭 Characters', 'nav:chars')
+            .text('🔓 Clear parks', 'park:clear'),
+        ),
+      );
+    } catch (err) {
+      await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
+    }
+  }
+
   /** Class chosen: offer a generated name, or let the operator type one. */
   private async viewNamePick(ctx: Context, walletId: string, classId: ClassId): Promise<void> {
     const suggested = generateName(classId);
@@ -554,14 +592,20 @@ export class ControlBot {
           : createWallets(this.cfg.RELIC_KEYS_DIR, n);
 
         const kb = new InlineKeyboard();
-        for (const w of made) kb.text(`🎭 Pick job — ${w.id}`, `chr:w:${w.id}`).row();
+        if (made.length > 1) {
+          kb.text(`🎯 One job for all ${made.length}`, 'chr:bulkpick').row();
+        }
+        for (const w of made) kb.text(`🎭 ${w.id}`, `chr:w:${w.id}`).row();
         kb.text('🔑 Back up keys', 'wal:export').row();
 
         await this.show(
           ctx,
           ui.renderMinted(made) +
             '\n\n<b>Next: give each wallet a job.</b>\n' +
-            '<i>A wallet without a character cannot enter the world.</i>',
+            '<i>A wallet without a character cannot enter the world.</i>' +
+            (made.length > 1
+              ? '\n<i>Pick one job for all of them, or choose per wallet.</i>'
+              : ''),
           ControlBot.backRow(kb),
         );
       } catch (err) {
@@ -681,6 +725,31 @@ export class ControlBot {
     this.bot.callbackQuery(/^chr:w:(.+)$/, async (ctx) => {
       await ctx.answerCallbackQuery();
       return this.viewCharacters(ctx, ctx.match![1]!);
+    });
+
+    this.bot.callbackQuery('chr:bulkpick', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const kb = new InlineKeyboard();
+      for (const c of CLASSES) kb.text(`${CLASS_ICON[c]} ${c}`, `chr:bulkgo:${c}`).row();
+      await this.show(
+        ctx,
+        [
+          '<b>🎯 One job for every wallet without a character</b>',
+          '',
+          'Each hero still gets its own generated name.',
+          '',
+          '⚠️ Names are permanent.',
+          '<i>🔒 classes will be refused on wallets that lack the RELIC —</i>',
+          '<i>those are reported individually, the rest still succeed.</i>',
+        ].join('\n'),
+        ControlBot.backRow(kb),
+      );
+    });
+
+    this.bot.callbackQuery(/^chr:bulkgo:(.+)$/, async (ctx) => {
+      const classId = ctx.match![1] as ClassId;
+      await ctx.answerCallbackQuery({ text: 'creating…' });
+      await this.bulkOnboard(ctx, classId);
     });
 
     this.bot.callbackQuery(/^chr:pick:([^:]+):(.+)$/, async (ctx) => {

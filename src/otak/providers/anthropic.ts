@@ -39,7 +39,7 @@ export class AnthropicProvider implements OtakProvider {
     try {
       await this.client.messages.create({
         model: this.model,
-        max_tokens: 16,
+        max_tokens: 8,
         messages: [{ role: 'user', content: 'Reply with the single word: ok' }],
       });
       return { ok: true, detail: `${this.model} reachable` };
@@ -52,13 +52,28 @@ export class AnthropicProvider implements OtakProvider {
     const res = await this.client.messages.create(
       {
         model: this.model,
-        max_tokens: 1024,
-        system: OTAK_SYSTEM,
+        // A decision is a one-line JSON object; 1024 was pure headroom.
+        max_tokens: 256,
+        // The instruction block is byte-identical on every call, so caching it
+        // makes the repeated part ~10x cheaper. The volatile candidate list is
+        // in the user turn, after the breakpoint, so it never invalidates.
+        system: [
+          {
+            type: 'text' as const,
+            text: OTAK_SYSTEM,
+            cache_control: { type: 'ephemeral' as const },
+          },
+        ],
         output_config: { effort: this.effort },
         messages: [{ role: 'user', content: renderRequest(req) }],
       },
       { timeout: timeoutMs },
     );
+
+    const u = res.usage as { cache_read_input_tokens?: number } | undefined;
+    if (u?.cache_read_input_tokens !== undefined) {
+      lastCacheRead = u.cache_read_input_tokens;
+    }
 
     if (res.stop_reason === 'refusal') {
       throw new Error(`anthropic refused: ${res.stop_details?.category ?? 'unknown'}`);
@@ -73,6 +88,12 @@ export class AnthropicProvider implements OtakProvider {
     if (!text) throw new Error('anthropic returned no text block');
     return parseReply(text);
   }
+}
+
+/** Last observed cache-read token count, surfaced in Telegram health. */
+let lastCacheRead = 0;
+export function otakCacheReadTokens(): number {
+  return lastCacheRead;
 }
 
 function describe(err: unknown): string {

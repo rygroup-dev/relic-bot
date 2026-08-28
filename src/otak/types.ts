@@ -80,14 +80,16 @@ export function renderRequest(req: OtakRequest): string {
     '',
     'Candidates:',
   ];
+  // Kept deliberately terse: this block is the only part billed on every call,
+  // so each candidate is one short line rather than a paragraph.
   for (const c of req.candidates) {
     const facts = c.facts
-      ? ' | ' +
+      ? ' ' +
         Object.entries(c.facts)
           .map(([k, v]) => `${k}=${v}`)
           .join(' ')
       : '';
-    lines.push(`- id=${c.id} score=${c.score.toFixed(3)} "${c.label}" :: ${c.rationale}${facts}`);
+    lines.push(`- ${c.id} s=${c.score.toFixed(2)} ${c.label}${facts}`);
   }
   if (req.constraints?.length) {
     lines.push('', 'Constraints:');

@@ -147,11 +147,24 @@ describe('reply parsing', () => {
   });
 });
 
-describe('prompt rendering carries no secrets', () => {
-  it('includes ids and facts but nothing key-shaped', () => {
+describe('prompt rendering is compact and secret-free', () => {
+  it('carries every candidate id and label', () => {
     const out = renderRequest(req);
-    expect(out).toContain('id=b');
-    expect(out).toContain('Ember Ring');
-    expect(out).not.toMatch(/sk-|eyJ|Bearer/);
+    for (const c of req.candidates) {
+      expect(out).toContain(c.id);
+      expect(out).toContain(c.label);
+    }
+  });
+
+  it('never leaks key-shaped material', () => {
+    expect(renderRequest(req)).not.toMatch(/sk-|eyJ|Bearer/);
+  });
+
+  it('spends one short line per candidate', () => {
+    // This block is billed on every Otak call, so its size is a cost decision,
+    // not a cosmetic one. Guard against it creeping back into paragraphs.
+    const lines = renderRequest(req).split('\n').filter((l) => l.startsWith('- '));
+    expect(lines).toHaveLength(req.candidates.length);
+    for (const l of lines) expect(l.length).toBeLessThan(90);
   });
 });
