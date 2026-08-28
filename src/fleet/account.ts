@@ -352,14 +352,25 @@ export class AccountRunner {
     this.phase = 'playing';
 
     // Town is a social hub: its `mobs` collection is always empty (verified
-    // live). Staying here produces nothing, so head into a dungeon.
-    await this.runDungeon();
-
-    let ticks = 0;
+    // live). Everything of value is in dungeons, so the session is a loop of
+    // runs — not one run followed by standing in the square.
+    //
+    // This was the cause of a 45-minute production freeze: a single run was
+    // made, then the loop fell through to the town tick, where there is
+    // nothing to fight and nothing to pick up. Zero errors, zero output.
+    let runs = 0;
     while (!this.stopping && !left && zone.connected) {
-      await this.tick();
-      await this.tempo();
-      if (++ticks % 60 === 0) await this.sellCycle();
+      await this.runDungeon();
+      runs += 1;
+
+      if (this.stopping || left || !zone.connected) break;
+
+      // Between runs: sell what the last one produced, then go again.
+      await this.sellCycle();
+      this.note = `between runs (${runs} completed)`;
+
+      // A short breather so a failed entry does not become a hot loop.
+      await sleep(5_000);
     }
 
     await zone.leave(true);
@@ -881,66 +892,6 @@ export class AccountRunner {
     }
   }
 
-  /** One decision + action. */
-  private async tick(): Promise<void> {
-    const zone = this.zone;
-    if (!zone?.connected) return;
-
-    const entities = readEntities(this.latestState);
-    const self: SelfView = readSelf(this.latestState, zone.sessionId);
-
-    // Loot first: pure gain, no combat risk.
-    const loot = lootCandidates(self, entities);
-    if (loot.length > 0) {
-      const outcome = await free(this.d.parks, this.account.id, 'loot', async () => {
-        const decision = await this.d.otak.decide({
-          domain: 'economy',
-          situation: `${loot.length} loot pile(s) in reach`,
-          candidates: loot,
-        });
-        if (!decision.chosenId) return false;
-        const parsed = parseCandidateId(decision.chosenId);
-        if (!parsed) return false;
-        zone.send(MSG.LOOT_PICKUP, { dropId: parsed.target });
-        return true;
-      });
-      if (outcome.ran && outcome.value) return;
-    }
-
-    const targets = combatCandidates(
-      self,
-      entities,
-      this.d.combat,
-      this.account.id,
-      DEFAULT_COMBAT_TUNING,
-    );
-
-    if (targets.length === 0) {
-      this.note = 'no engageable target (hurt, or nothing in reach)';
-      return;
-    }
-
-    await free(this.d.parks, this.account.id, 'combat', async () => {
-      const decision = await this.d.otak.decide({
-        domain: 'combat',
-        situation: `hp=${self.hp ?? '?'} / ${self.maxHp ?? '?'}, ${targets.length} target(s) in reach`,
-        candidates: targets,
-        constraints: ['Do not engage if the risk outweighs the reward; returning null is fine.'],
-      });
-      if (!decision.chosenId) {
-        this.note = `otak declined: ${decision.reasoning}`;
-        return;
-      }
-      const parsed = parseCandidateId(decision.chosenId);
-      if (!parsed) return;
-      this.note = `attacking ${parsed.target} (${decision.source})`;
-      zone.send(MSG.ATTACK, {
-        targetId: parsed.target,
-        fromCol: self.pos ? Math.round(self.pos.x) : undefined,
-        fromRow: self.pos ? Math.round(self.pos.y) : undefined,
-      });
-    });
-  }
 
   /**
    * Sell farmed loot. The bot's only revenue channel - and it needs no
