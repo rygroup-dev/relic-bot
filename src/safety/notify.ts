@@ -69,6 +69,29 @@ const ICON: Record<EventKind, string> = {
   run_finished: '🏁',
 };
 
+/** Human-readable heading per event kind. */
+const LABEL: Record<EventKind, string> = {
+  ban: 'Banned',
+  fleet_park: 'Fleet stopped',
+  sweep_executed: 'Sweep executed',
+  suspicious: 'Something looks wrong',
+  sale_listed: 'Listed for sale',
+  sale_settled: 'Sale settled',
+  level_up: 'Level up',
+  rare_drop: 'Rare drop',
+  silence: 'Producing nothing',
+  character_created: 'Wallets joined',
+  gate_opened: 'Token gate opened',
+  account_park: 'Wallet parked',
+  loot: 'Loot',
+  kill: 'Kill',
+  run_finished: 'Run finished',
+};
+
+export function labelOf(kind: EventKind): string {
+  return LABEL[kind];
+}
+
 export interface NotifyEvent {
   kind: EventKind;
   accountId?: string;
@@ -137,9 +160,18 @@ export class Notifier {
     return true;
   }
 
+  /**
+   * Render an event for chat.
+   *
+   * The wallet is part of the message, not decoration: "reached level 7" is
+   * useless across a seventeen-wallet fleet if you cannot tell which hero did
+   * it. Kept here so every sink formats identically.
+   */
   format(event: NotifyEvent): string {
-    const who = event.accountId ? ` ${event.accountId}` : '';
-    return `${iconOf(event.kind)}${who ? `<b>${who}</b>` : ''} ${event.text}`;
+    const icon = iconOf(event.kind);
+    const label = LABEL[event.kind];
+    const who = event.accountId ? ` · <b>${event.accountId}</b>` : '';
+    return `${icon} <b>${label}</b>${who}\n${event.text}`;
   }
 }
 

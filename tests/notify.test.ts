@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   Notifier,
   severityOf,
+  labelOf,
   detectSuspicious,
   type NotifyEvent,
 } from '../src/safety/notify.js';
@@ -158,5 +159,36 @@ describe('the events an operator actually wants to hear about', () => {
     expect(n.shouldSend(ev({ kind: 'level_up', accountId: 'w1' }), now + 60_000)).toBe(false);
     // A different wallet is still worth hearing.
     expect(n.shouldSend(ev({ kind: 'level_up', accountId: 'w2' }), now + 60_000)).toBe(true);
+  });
+});
+
+describe('a notification names the wallet it is about', () => {
+  it('includes the wallet id, a label and the detail', () => {
+    const n = new Notifier();
+    const out = n.format({ kind: 'level_up', accountId: 'wallet-07', text: 'reached level 9' });
+    // Across seventeen wallets, "reached level 9" alone is unusable.
+    expect(out).toContain('wallet-07');
+    expect(out).toContain('Level up');
+    expect(out).toContain('reached level 9');
+    expect(out).toContain('⭐');
+  });
+
+  it('reads correctly for a fleet-wide event with no wallet', () => {
+    const out = new Notifier().format({ kind: 'fleet_park', text: 'client_outdated' });
+    expect(out).toContain('Fleet stopped');
+    expect(out).not.toContain('·');
+  });
+
+  it('gives every event kind a human label, not a raw enum', () => {
+    const n = new Notifier();
+    for (const kind of [
+      'ban', 'fleet_park', 'sweep_executed', 'suspicious', 'sale_listed',
+      'sale_settled', 'level_up', 'rare_drop', 'silence', 'character_created',
+      'gate_opened', 'account_park', 'loot', 'kill', 'run_finished',
+    ] as const) {
+      const out = n.format({ kind, text: 'x' });
+      expect(out, kind).not.toContain(kind); // no snake_case leaking into chat
+      expect(labelOf(kind).length).toBeGreaterThan(0);
+    }
   });
 });

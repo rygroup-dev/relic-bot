@@ -1095,7 +1095,10 @@ export class ControlBot {
     for (const id of this.opts.ownerIds) {
       try {
         await this.bot.api.sendMessage(id, redact(text), {
-          reply_markup: new InlineKeyboard().text('⚔️ Fleet', 'nav:status').text('🅿️ Parks', 'nav:parks'),
+          parse_mode: 'HTML',
+          reply_markup: new InlineKeyboard()
+            .text('⚔️ Fleet', 'nav:status')
+            .text('🅿️ Parks', 'nav:parks'),
         });
       } catch (e) {
         log.warn(`notify ${id} failed: ${(e as Error).message}`);
@@ -1105,7 +1108,9 @@ export class ControlBot {
 
   async start(): Promise<void> {
     this.rebuildProviders();
-    this.fleet.onAlert((a) => this.notify(`[${a.kind.toUpperCase()}] ${a.text}`));
+    // Use the pre-rendered text: it carries the wallet id, which a bare
+    // "reached level 7" across seventeen wallets does not.
+    this.fleet.onAlert((a) => this.notify(a.formatted ?? `${a.kind}: ${a.text}`));
     await this.bot.api.setMyCommands([
       { command: 'menu', description: 'Main menu' },
       { command: 'status', description: 'Fleet status' },

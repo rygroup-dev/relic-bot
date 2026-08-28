@@ -32,6 +32,8 @@ export interface FleetAlert {
   kind: EventKind;
   text: string;
   accountId?: string;
+  /** Pre-rendered for chat, so a sink cannot accidentally drop the wallet. */
+  formatted: string;
 }
 
 export type AlertSink = (alert: FleetAlert) => void | Promise<void>;
@@ -103,7 +105,7 @@ export class Fleet {
     this.alertSinks.push(sink);
   }
 
-  private async alert(a: FleetAlert): Promise<void> {
+  private async alert(a: Omit<FleetAlert, 'formatted'> & { formatted?: string }): Promise<void> {
     // Grade before sending: a channel full of routine noise stops being read,
     // and then a real alert goes unnoticed too.
     const event = { kind: a.kind, text: a.text, ...(a.accountId ? { accountId: a.accountId } : {}) };
@@ -111,9 +113,10 @@ export class Fleet {
       log.debug(`suppressed ${a.kind}: ${a.text.slice(0, 80)}`);
       return;
     }
+    a.formatted = this.notifier.format(event);
     for (const s of this.alertSinks) {
       try {
-        await s(a);
+        await s(a as FleetAlert);
       } catch (e) {
         log.warn(`alert sink failed: ${(e as Error).message}`);
       }
