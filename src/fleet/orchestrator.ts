@@ -68,6 +68,7 @@ export class Fleet {
 
     this.deps = {
       cfg,
+      alert: (kind, text, accountId) => void this.alert({ kind, text, accountId }),
       auth: new AuthClient(rest),
       parks: this.parks,
       ledger: this.ledger,

@@ -133,3 +133,30 @@ describe('suspicion detection is deliberately conservative', () => {
     ).toBeNull();
   });
 });
+
+describe('the events an operator actually wants to hear about', () => {
+  it('sends a level-up, a rare drop and a gate opening', () => {
+    const n = new Notifier();
+    for (const kind of ['level_up', 'rare_drop', 'gate_opened'] as const) {
+      expect(severityOf(kind)).toBe('important');
+      expect(n.shouldSend(ev({ kind, accountId: kind }))).toBe(true);
+    }
+  });
+
+  it('still refuses the constant background noise', () => {
+    const n = new Notifier();
+    // Loot and kills happen continuously — a rare drop is the signal, an
+    // ordinary drop is the noise that would bury it.
+    expect(n.shouldSend(ev({ kind: 'loot' }))).toBe(false);
+    expect(n.shouldSend(ev({ kind: 'kill' }))).toBe(false);
+  });
+
+  it('does not let one wallet levelling repeatedly flood the chat', () => {
+    const n = new Notifier({ dedupeWindowMs: 10 * 60_000 });
+    const now = Date.now();
+    expect(n.shouldSend(ev({ kind: 'level_up', accountId: 'w1' }), now)).toBe(true);
+    expect(n.shouldSend(ev({ kind: 'level_up', accountId: 'w1' }), now + 60_000)).toBe(false);
+    // A different wallet is still worth hearing.
+    expect(n.shouldSend(ev({ kind: 'level_up', accountId: 'w2' }), now + 60_000)).toBe(true);
+  });
+});

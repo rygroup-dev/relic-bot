@@ -80,6 +80,8 @@ export interface AccountStatus {
 
 export interface AccountDeps {
   cfg: Config;
+  /** Raised for things worth interrupting a person for. */
+  alert?: (kind: 'level_up' | 'rare_drop' | 'gate_opened', text: string, accountId: string) => void;
   auth: AuthClient;
   parks: ParkRegistry;
   ledger: Ledger;
@@ -123,6 +125,10 @@ export class AccountRunner {
   /** Set by `d.resurrection.state`. */
   private resurrectionReady = false;
   private descendSentAt = 0;
+  /** Last level seen, so a level-up is detected rather than polled. */
+  private lastLevel: number | null = null;
+  /** Gate state at the previous check, to notice it opening. */
+  private lastGateAllowed: boolean | null = null;
 
   /**
    * Every message from the dungeon room.
@@ -132,6 +138,17 @@ export class AccountRunner {
    */
   private onDungeonSignal(type: string, payload: unknown): void {
     this.signals.apply(type, payload, this.dungeonSessionId);
+
+    // A mythic or legendary drop is worth telling someone about; commons are
+    // constant noise and must never reach the chat.
+    if (type === DUNGEON_IN.DROP_SPAWN || type === DUNGEON_IN.BOSS_LOOT) {
+      const r = payload as { rarity?: unknown; name?: unknown } | null;
+      const rarity = typeof r?.rarity === 'string' ? r.rarity.toLowerCase() : null;
+      if (rarity === 'mythic' || rarity === 'legendary' || rarity === 'cosmetic') {
+        const name = typeof r?.name === 'string' ? r.name : 'an item';
+        this.d.alert?.('rare_drop', `${rarity} drop: ${name}`, this.account.id);
+      }
+    }
 
     if (SIGNAL_VALUE.includes(type)) {
       this.d.ledger.append({
@@ -202,7 +219,15 @@ export class AccountRunner {
 
   /** Read vitals straight from the latest room state. */
   private vitals(): AccountStatus['vitals'] {
-    const s = readSelf(this.latestState, this.zone?.sessionId ?? null);
+    const s = readSelf(this.dungeonState ?? this.latestState, this.dungeonSessionId ?? this.zone?.sessionId ?? null);
+
+    // A level-up is real progress and rare enough to be worth a message.
+    if (s.level !== null) {
+      if (this.lastLevel !== null && s.level > this.lastLevel) {
+        this.d.alert?.('level_up', `reached level ${s.level}`, this.account.id);
+      }
+      this.lastLevel = s.level;
+    }
     return {
       hp: s.hp,
       maxHp: s.maxHp,
@@ -288,7 +313,12 @@ export class AccountRunner {
     if (!this.gateStatus.allowed) {
       this.note = 'token gate CLOSED - market features unavailable, still farming';
       this.log.warn(this.note);
+    } else if (this.lastGateAllowed === false) {
+      // The wallet crossed the holding requirement: selling just became
+      // possible, which changes what this wallet is for.
+      this.d.alert?.('gate_opened', 'token gate is now OPEN — selling unlocked', this.account.id);
     }
+    this.lastGateAllowed = this.gateStatus.allowed;
 
     this.phase = 'connecting';
     const zone = new ZoneConnection({
