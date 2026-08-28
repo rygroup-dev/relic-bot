@@ -150,3 +150,40 @@ describe('run lifecycle', () => {
     expect(() => s.apply('s.something.new', { x: 1 }, ME)).not.toThrow();
   });
 });
+
+describe('kills are counted from the only evidence there is', () => {
+  it('counts a mob death as a kill, not as our own', () => {
+    const s = new SignalState();
+    s.apply(SIG.DEATH, { id: 'mob-7', name: 'Ghoul' }, ME);
+    expect(s.dead).toBe(false);
+    expect(s.drainKills()).toEqual(['Ghoul']);
+  });
+
+  it('does not count our own death as a kill', () => {
+    const s = new SignalState();
+    s.apply(SIG.DEATH, { id: ME }, ME);
+    expect(s.drainKills()).toEqual([]);
+    expect(s.dead).toBe(true);
+  });
+
+  it('drains so each kill is counted exactly once', () => {
+    const s = new SignalState();
+    s.apply(SIG.DEATH, { id: 'a', name: 'Rat' }, ME);
+    s.apply(SIG.DEATH, { id: 'b', name: 'Rat' }, ME);
+    expect(s.drainKills()).toHaveLength(2);
+    expect(s.drainKills()).toHaveLength(0);
+  });
+
+  it('falls back to a placeholder rather than dropping an unnamed kill', () => {
+    const s = new SignalState();
+    s.apply(SIG.DEATH, { id: 'mob-9' }, ME);
+    expect(s.drainKills()).toEqual(['unknown']);
+  });
+
+  it('clears kills between runs', () => {
+    const s = new SignalState();
+    s.apply(SIG.DEATH, { id: 'a', name: 'Rat' }, ME);
+    s.resetRun();
+    expect(s.drainKills()).toEqual([]);
+  });
+});

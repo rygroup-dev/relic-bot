@@ -110,6 +110,8 @@ export class SignalState {
   private _resync: { col: number; row: number } | null = null;
   private _goldGained = 0;
   private _xpGained = 0;
+  /** Mob deaths observed this run, with whatever name the server gave. */
+  private _kills: string[] = [];
 
   get inventory(): readonly InventoryEntry[] {
     return this._inventory;
@@ -128,6 +130,13 @@ export class SignalState {
   }
   get xpGained(): number {
     return this._xpGained;
+  }
+
+  /** Take the kills seen since the last call, so each is counted once. */
+  drainKills(): string[] {
+    const out = this._kills;
+    this._kills = [];
+    return out;
   }
 
   /** A pending resync the server asked for after refusing a move. */
@@ -224,11 +233,15 @@ export class SignalState {
         break;
 
       case SIG.DEATH: {
-        // Only our own death changes what the bot should do.
         const who = pick(payload, ['id', 'sessionId', 'userId']);
         if (selfId && typeof who === 'string' && who === selfId) {
           this._dead = true;
           log.warn('hero died');
+        } else {
+          // Anything else dying is a kill. The server does not send a separate
+          // "you killed X" signal — this is the only kill evidence there is.
+          const name = pick(payload, ['name', 'monsterId', 'kind', 'type']);
+          this._kills.push(typeof name === 'string' && name ? name : 'unknown');
         }
         break;
       }
@@ -253,6 +266,7 @@ export class SignalState {
   resetRun(): void {
     this._goldGained = 0;
     this._xpGained = 0;
+    this._kills = [];
     this._dead = false;
     this._lastTelegraphAt = 0;
   }

@@ -310,8 +310,17 @@ export class AccountRunner {
             detail: t,
           });
         }
-        if (t === SIG.DEATH && this.signals.dead) {
-          this.note = 'died in the dungeon';
+        if (t === SIG.DEATH) {
+          if (this.signals.dead) {
+            this.note = 'died in the dungeon';
+          } else {
+            // Record every mob death as a battle won. This is the second
+            // liveness detector: a rising battle count proves the bot is
+            // actually fighting, independently of the value ledger.
+            for (const monster of this.signals.drainKills()) {
+              this.d.combat.record(this.account.id, monster, 'win');
+            }
+          }
         }
       });
 
