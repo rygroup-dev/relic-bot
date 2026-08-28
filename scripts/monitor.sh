@@ -50,8 +50,8 @@ PY
   # Notification-side counters: an operator needs to know the alarms fired,
   # not just that the fleet was quiet.
   S="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -c 'produced NOTHING')"
-  V="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -c 'producing again')"
-  N="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -cE 'Level up|Rare drop|Token gate opened|Producing nothing|Banned|Fleet stopped')"
+  V="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -c 'notify: .*producing again')"
+  N="$(journalctl -u relic-bot --since "$SINCE" --no-pager 2>/dev/null | grep -c 'notify:')"
   printf '%s  %7s %6s %8s %6s %9s %5s %9s %7s %9s %6s\n' \
     "$TS" "$B" "$L" "$D" "$X" "$R" "$P" "$W" "$S" "$V" "$N" >> "$OUT"
   [ "$i" -lt "$SAMPLES" ] && sleep "$INTERVAL"

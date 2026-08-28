@@ -1092,6 +1092,12 @@ export class ControlBot {
   // --------------------------------------------------------------- alerts --
 
   async notify(text: string): Promise<void> {
+    // Log every send. Without this there is no record that an operator was
+    // actually told anything: a monitor can prove the fleet went quiet but not
+    // that the alarm reached a human, and those are different failures.
+    const summary = redact(text).replace(/<[^>]+>/g, '').split('\n')[0]?.slice(0, 90) ?? '';
+    log.info(`notify: ${summary}`);
+
     for (const id of this.opts.ownerIds) {
       try {
         await this.bot.api.sendMessage(id, redact(text), {

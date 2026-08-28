@@ -272,7 +272,16 @@ export class AccountRunner {
           this.log.error(err.message);
           return; // a banned account never retries
         }
-        this.log.warn(`cycle ended: ${(err as Error).message}`);
+        const msg = (err as Error).message;
+        this.log.warn(`cycle ended: ${msg}`);
+
+        // Only throw the token away when the server actually rejected it.
+        // A dropped socket or a refused dungeon entry says nothing about
+        // whether we are still authenticated.
+        if (/401|403|unauthor|invalid.?token|expired/i.test(msg)) {
+          this.log.info('session rejected — will re-authenticate');
+          this.session = null;
+        }
         this.d.parks.parkFromRefusal(this.account.id, 'session', err);
       }
       if (this.stopping) break;
@@ -301,13 +310,27 @@ export class AccountRunner {
     }
   }
 
-  private async sessionCycle(): Promise<void> {
+  /**
+   * A JWT is valid for days; a room connection is not.
+   *
+   * Re-authenticating every time the town socket drops was burning the shared
+   * auth gate — 13 of 13 parks in a 30-minute run were `rate_limited` on login,
+   * and the limiter widened to its 180s ceiling. Reusing a token we already
+   * hold costs nothing and is what the real client does.
+   */
+  private async ensureSession(): Promise<Session> {
+    if (this.session) return this.session;
     this.phase = 'authenticating';
     this.session = await this.d.auth.login(this.account);
+    return this.session;
+  }
+
+  private async sessionCycle(): Promise<void> {
+    const session = await this.ensureSession();
 
     this.gateStatus = await this.d.gate.check(
       this.account.id,
-      this.session.token,
+      session.token,
       this.account.address,
     );
     if (!this.gateStatus.allowed) {
@@ -324,11 +347,11 @@ export class AccountRunner {
     const zone = new ZoneConnection({
       endpoint: zoneEndpoint(this.d.cfg.RELIC_BASE_URL),
       room: ROOM.TOWN,
-      token: this.session.token,
-      ...(this.session.character?.name ? { name: this.session.character.name } : {}),
-      ...(this.session.character?.classId ? { classId: this.session.character.classId } : {}),
-      ...(typeof this.session.character?.level === 'number'
-        ? { level: this.session.character.level }
+      token: session.token,
+      ...(session.character?.name ? { name: session.character.name } : {}),
+      ...(session.character?.classId ? { classId: session.character.classId } : {}),
+      ...(typeof session.character?.level === 'number'
+        ? { level: session.character.level }
         : {}),
       duelsDisabled: true,
     });
