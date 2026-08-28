@@ -1,0 +1,20 @@
+node_modules/
+dist/
+data/
+logs/
+*.log
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+keys/
+*.key
+*.keypair.json
+wallets/
+otak-keys.json.enc
+
+# tooling noise
+.claude-flow/
+.claude/
+.swarm/

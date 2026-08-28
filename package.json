@@ -1,0 +1,37 @@
+{
+  "name": "relic-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-account automation + LLM 'Otak' orchestrator for playrelic.gg (Solana / Token-2022)",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node --enable-source-maps dist/index.js",
+    "dev": "tsx src/index.ts",
+    "ctl": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.122.0",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.95.8",
+    "bs58": "^6.0.0",
+    "colyseus.js": "0.16.22",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.30.0",
+    "tweetnacl": "^1.0.3",
+    "undici": "^7.2.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}
