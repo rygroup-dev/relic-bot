@@ -11,6 +11,7 @@ import type { Account } from '../wallet/keystore.js';
 import { AuthClient, BannedError, type Session } from '../auth/client.js';
 import { ZoneConnection, zoneEndpoint } from '../net/zone.js';
 import { enterSoloDungeon, EntryDeniedError, DUNGEON_IN, VALUE_SIGNALS } from '../net/lobby.js';
+import { SignalState, SIG, VALUE_SIGNALS as SIGNAL_VALUE } from '../net/signals.js';
 import { MSG, ROOM } from '../protocol/messages.js';
 import { free, ParkRegistry } from '../safety/park.js';
 import { Ledger, CombatMemory } from '../safety/ledger.js';
@@ -88,6 +89,8 @@ export class AccountRunner {
   private gateStatus: GateStatus | null = null;
   /** Monotonic move sequence, as the client sends with every i.move. */
   private moveSeq = 0;
+  /** Everything the s.* signal stream tells us — inventory, gold, cooldowns. */
+  private signals = new SignalState();
 
   constructor(
     readonly account: Account,
@@ -284,7 +287,26 @@ export class AccountRunner {
 
       const { room, client } = entry;
       this.note = 'in dungeon';
+      this.signals.resetRun();
       let finished = false;
+
+      // The s.* namespace carries inventory, gold, xp, cooldowns and deaths.
+      // Without it the bot fights blind and the ledger never sees a thing.
+      room.onMessage('*', (type: unknown, payload: unknown) => {
+        const t = String(type);
+        this.signals.apply(t, payload, room.sessionId);
+
+        if (SIGNAL_VALUE.includes(t)) {
+          this.d.ledger.append({
+            accountId: this.account.id,
+            kind: t === SIG.LOOT_GOLD ? 'gold' : 'loot',
+            detail: t,
+          });
+        }
+        if (t === SIG.DEATH && this.signals.dead) {
+          this.note = 'died in the dungeon';
+        }
+      });
 
       for (const type of VALUE_SIGNALS) {
         room.onMessage(type, (payload: unknown) => {
@@ -341,16 +363,18 @@ export class AccountRunner {
       return null;
     }
 
-    const self = readSelf(this.latestState, zone.sessionId);
-    if (!self.pos) {
-      // Position unknown: ask to move straight to the trapdoor and hope the
-      // server pathfinds. Worst case it refuses and we report `too_far`.
-      zone.send(MSG.MOVE, { col: target.col, row: target.row, seq: ++this.moveSeq });
-      await sleep(3_000);
-      return target;
+    // Room state arrives asynchronously after joinOrCreate resolves. Walking
+    // before it lands means walking from an unknown position, which is how the
+    // first attempt ended up requesting entry from the spawn point and being
+    // refused with `too_far`.
+    const self = await this.awaitPosition(zone, 12_000);
+    if (!self?.pos) {
+      this.log.warn('no position after 12s of room state — cannot walk to the trapdoor');
+      return null;
     }
 
     const from: Cell = { col: Math.round(self.pos.x), row: Math.round(self.pos.y) };
+    this.log.info(`at (${from.col},${from.row}), trapdoor at (${target.col},${target.row})`);
     const path = findPath(map, from, target);
     if (!path) {
       this.log.warn(`no route from (${from.col},${from.row}) to the dungeon entrance`);
@@ -358,14 +382,42 @@ export class AccountRunner {
     }
 
     this.note = `walking to the dungeon entrance (${path.length} steps)`;
+    this.log.info(`walking ${path.length} steps to the dungeon entrance`);
     for (const step of path) {
       if (this.stopping || !zone.connected) break;
       zone.send(MSG.MOVE, { col: step.col, row: step.row, seq: ++this.moveSeq });
       // Roughly the client's own step cadence; moving faster invites a desync.
       await sleep(220);
     }
-    await sleep(1_200);
+
+    // Let the server settle our final position before asking to descend.
+    await sleep(1_500);
+    const arrived = readSelf(this.latestState, zone.sessionId);
+    if (arrived.pos) {
+      const dist = Math.hypot(arrived.pos.x - target.col, arrived.pos.y - target.row);
+      this.log.info(
+        `arrived at (${Math.round(arrived.pos.x)},${Math.round(arrived.pos.y)}), ` +
+          `${dist.toFixed(1)} cells from the trapdoor`,
+      );
+    }
     return target;
+  }
+
+  /**
+   * Wait for the room to tell us where we are.
+   *
+   * Colyseus delivers state after the join promise resolves, so anything that
+   * depends on position has to wait for it rather than assume it is there.
+   */
+  private async awaitPosition(zone: ZoneConnection, timeoutMs: number): Promise<SelfView | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.stopping || !zone.connected) return null;
+      const self = readSelf(this.latestState, zone.sessionId);
+      if (self.pos) return self;
+      await sleep(400);
+    }
+    return null;
   }
 
   /**
@@ -404,40 +456,33 @@ export class AccountRunner {
     return outcome.ran && outcome.value === true;
   }
 
-  /** Inventory as the action layer expects it, read defensively from state. */
+  /**
+   * Inventory, from the `s.inv.sync` signal.
+   *
+   * It is NOT in the room state — reading it from there always came back
+   * empty, which silently disabled every potion and equip decision.
+   */
   private inventory(): InventoryItem[] {
-    const state = this.latestState;
-    if (!state || typeof state !== 'object') return [];
-    const rec = state as Record<string, unknown>;
-    const inv = rec.inventory ?? rec.items;
-    if (!inv || typeof inv !== 'object') return [];
-
-    const out: InventoryItem[] = [];
-    for (const [key, v] of Object.entries(inv as Record<string, unknown>)) {
-      if (!v || typeof v !== 'object') continue;
-      const r = v as Record<string, unknown>;
-      const name = typeof r.name === 'string' ? r.name : null;
-      if (!name) continue;
-      const item: InventoryItem = { name };
-      if (typeof r.instanceId === 'string') item.instanceId = r.instanceId;
-      item.itemId = typeof r.itemId === 'string' ? r.itemId : key;
-      if (typeof r.slot === 'string') item.slot = r.slot;
-      if (typeof r.rarity === 'string') item.rarity = r.rarity;
-      if (typeof r.quantity === 'number') item.quantity = r.quantity;
-      if (typeof r.equipped === 'boolean') item.equipped = r.equipped;
-      if (typeof r.consumable === 'boolean') item.consumable = r.consumable;
+    return this.signals.inventory.map((e) => {
+      const item: InventoryItem = { name: e.name };
+      if (e.instanceId) item.instanceId = e.instanceId;
+      if (e.itemId) item.itemId = e.itemId;
+      if (e.slot) item.slot = e.slot;
+      if (e.rarity) item.rarity = e.rarity;
+      if (e.quantity !== undefined) item.quantity = e.quantity;
+      if (e.equipped !== undefined) item.equipped = e.equipped;
+      if (e.consumable !== undefined) item.consumable = e.consumable;
       // The server does not label what a potion restores, so infer from the
       // name rather than inventing a field that is not there.
       if (item.consumable) {
-        item.restores = /mana|spirit|ether/i.test(name)
+        item.restores = /mana|spirit|ether/i.test(e.name)
           ? 'mana'
-          : /health|heal|life|hp/i.test(name)
+          : /health|heal|life|hp/i.test(e.name)
             ? 'hp'
             : null;
       }
-      out.push(item);
-    }
-    return out;
+      return item;
+    });
   }
 
   /** Abilities exposed on the player record, if any. */
@@ -454,7 +499,10 @@ export class AccountRunner {
         };
         if (typeof a.name === 'string') out.name = a.name;
         if (typeof a.manaCost === 'number') out.manaCost = a.manaCost;
-        if (typeof a.readyAt === 'number') out.readyAt = a.readyAt;
+        // Prefer the cooldown the server actually told us about.
+        const observed = this.signals.cooldownReadyAt(out.abilityId);
+        if (observed !== undefined) out.readyAt = observed;
+        else if (typeof a.readyAt === 'number') out.readyAt = a.readyAt;
         return out;
       })
       .filter((a) => a.abilityId.length > 0);
@@ -473,8 +521,22 @@ export class AccountRunner {
 
   /** One decision inside a dungeon, where the mobs actually are. */
   private async dungeonTick(room: { send: (t: string, p?: unknown) => void }): Promise<void> {
+    // A dead hero cannot act; hammering the server changes nothing.
+    if (this.signals.dead) {
+      this.note = 'dead — waiting for the run to end';
+      return;
+    }
+
     const entities = readEntities(this.latestState);
     const self = readSelf(this.latestState, null);
+
+    // An incoming attack telegraph is the one moment where moving beats
+    // attacking. Roll first, ask questions after.
+    if (this.signals.underTelegraph()) {
+      this.note = 'dodging a telegraphed attack';
+      room.send(MSG.ROLL, {});
+      return;
+    }
 
     // Stay alive and geared before picking a fight.
     const target = entities.find((e) => e.kind === 'monster')?.id ?? null;
