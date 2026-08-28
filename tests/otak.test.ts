@@ -227,3 +227,64 @@ describe('one brain drives the whole fleet, and OFF is not degraded', () => {
     expect((await o.decide(many)).source).toBe('heuristic');
   });
 });
+
+describe('the brain\'s work is visible and measurable', () => {
+  const two: OtakRequest = {
+    domain: 'combat',
+    situation: 'two targets',
+    candidates: [
+      { id: 'a', label: 'rat', score: 0.9, rationale: 'easy' },
+      { id: 'b', label: 'ogre', score: 0.4, rationale: 'hard' },
+    ],
+  };
+
+  it('records a heuristic decision even with the brain off', async () => {
+    const o = new Otak({ ...opts, enabled: false });
+    await o.decide(two);
+    const [d] = o.recentDecisions();
+    expect(d!.source).toBe('heuristic');
+    expect(d!.chosenId).toBe('a');
+    expect(o.stats().heuristic).toBe(1);
+  });
+
+  it('marks an override so a real change is distinguishable from agreement', async () => {
+    const o = new Otak(opts);
+    o.setProviders([stub('anthropic', { chosenId: 'b' })]);
+    await o.decide(two);
+    const [d] = o.recentDecisions();
+    expect(d!.source).toBe('llm');
+    expect(d!.overrode).toBe(true);
+    expect(d!.heuristicChoice).toBe('a');
+    expect(o.stats().overrides).toBe(1);
+    expect(o.stats().overrideRate).toBe(1);
+  });
+
+  it('does not count agreement as an override', async () => {
+    const o = new Otak(opts);
+    o.setProviders([stub('anthropic', { chosenId: 'a' })]);
+    await o.decide(two);
+    expect(o.recentDecisions()[0]!.overrode).toBe(false);
+    expect(o.stats().overrideRate).toBe(0);
+  });
+
+  it('counts guardrail rejections separately from decisions', async () => {
+    const o = new Otak(opts);
+    o.setProviders([stub('openai', { chosenId: 'not-a-real-id' })]);
+    await o.decide(two);
+    expect(o.stats().rejected).toBe(1);
+  });
+
+  it('keeps history bounded and newest-first', async () => {
+    const o = new Otak({ ...opts, enabled: false });
+    for (let i = 0; i < 60; i++) await o.decide(two);
+    const recent = o.recentDecisions(100);
+    expect(recent.length).toBeLessThanOrEqual(40);
+    for (let i = 1; i < recent.length; i++) {
+      expect(recent[i - 1]!.at).toBeGreaterThanOrEqual(recent[i]!.at);
+    }
+  });
+
+  it('reports a zero override rate before any model call', () => {
+    expect(new Otak(opts).stats().overrideRate).toBe(0);
+  });
+});

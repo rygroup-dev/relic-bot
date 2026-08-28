@@ -296,7 +296,9 @@ export class ControlBot {
       .text('🔑 OpenAI', 'otak:key:openai')
       .text('🔑 Anthropic', 'otak:key:anthropic')
       .row()
-      .text('🔑 Fugu', 'otak:key:fugu');
+      .text('🔑 Fugu', 'otak:key:fugu')
+      .row()
+      .text('📊 What it decided', 'otak:decisions');
 
     await this.show(
       ctx,
@@ -571,6 +573,13 @@ export class ControlBot {
     this.bot.command('wallets', (ctx) => this.viewWallets(ctx));
     this.bot.command('holdings', (ctx) => this.viewHoldings(ctx));
     this.bot.command('otak', (ctx) => this.viewOtak(ctx));
+    this.bot.command('decisions', async (ctx) => {
+      await this.show(
+        ctx,
+        ui.renderDecisions(this.fleet.otak.recentDecisions(8), this.fleet.otak.stats()),
+        ControlBot.backRow(new InlineKeyboard().text('🧠 Otak', 'nav:otak')),
+      );
+    });
     this.bot.command('characters', (ctx) => this.viewCharacterWallets(ctx));
     this.bot.command('sweep', (ctx) => this.runTreasury(ctx, 'sweep', false));
     this.bot.command('fund', (ctx) => this.runTreasury(ctx, 'fund', false));
@@ -821,6 +830,19 @@ export class ControlBot {
       return this.viewOtak(ctx);
     });
 
+    this.bot.callbackQuery('otak:decisions', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      await this.show(
+        ctx,
+        ui.renderDecisions(this.fleet.otak.recentDecisions(8), this.fleet.otak.stats()),
+        ControlBot.backRow(
+          new InlineKeyboard()
+            .text('🔄 Refresh', 'otak:decisions')
+            .text('🧠 Otak', 'nav:otak'),
+        ),
+      );
+    });
+
     this.bot.callbackQuery('otak:health', async (ctx) => {
       await ctx.answerCallbackQuery({ text: 'probing…' });
       this.rebuildProviders();
@@ -978,6 +1000,7 @@ export class ControlBot {
       { command: 'gate', description: 'Token-gate state' },
       { command: 'characters', description: 'Roster and hero creation' },
       { command: 'otak', description: 'The LLM brain' },
+      { command: 'decisions', description: 'What the brain actually decided' },
       { command: 'parks', description: 'What is blocked, and why' },
     ]);
     void this.bot.start({ onStart: () => log.info('telegram control bot online') });

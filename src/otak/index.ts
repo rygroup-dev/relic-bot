@@ -11,6 +11,7 @@
  */
 
 import type {
+  Domain,
   OtakDecision,
   OtakProvider,
   OtakRequest,
@@ -33,6 +34,23 @@ export interface ProviderHealth {
   ok: boolean;
   detail: string;
   checkedAt: number;
+}
+
+/** A decision as it happened, kept so its work can actually be judged. */
+export interface DecisionRecord {
+  at: number;
+  domain: Domain;
+  source: 'heuristic' | 'llm';
+  provider?: string;
+  /** What the heuristics would have picked on their own. */
+  heuristicChoice: string | null;
+  /** What was actually chosen. */
+  chosenId: string | null;
+  /** True when the model moved off the heuristic pick. */
+  overrode: boolean;
+  confidence: number;
+  reasoning: string;
+  candidateCount: number;
 }
 
 /** Heuristic fallback: the highest-scoring candidate, or none. */
@@ -58,6 +76,10 @@ export class Otak {
   private providers: OtakProvider[] = [];
   private health = new Map<string, ProviderHealth>();
   private callTimes: number[] = [];
+  /** Rolling window of recent decisions, newest last. */
+  private history: DecisionRecord[] = [];
+  private static readonly HISTORY_LIMIT = 40;
+  private counts = { llm: 0, heuristic: 0, overrides: 0, rejected: 0 };
 
   constructor(private opts: OtakOptions) {}
 
@@ -92,6 +114,39 @@ export class Otak {
     return [...this.health.values()];
   }
 
+  /** Most recent decisions, newest first. */
+  recentDecisions(limit = 10): DecisionRecord[] {
+    return this.history.slice(-limit).reverse();
+  }
+
+  /**
+   * How much the brain is actually contributing.
+   *
+   * `overrideRate` is the honest measure: if the model almost never moves off
+   * the heuristic pick, it is costing tokens without changing behaviour.
+   */
+  stats(): {
+    llm: number;
+    heuristic: number;
+    overrides: number;
+    rejected: number;
+    overrideRate: number;
+  } {
+    const rate = this.counts.llm === 0 ? 0 : this.counts.overrides / this.counts.llm;
+    return { ...this.counts, overrideRate: rate };
+  }
+
+  private record(r: DecisionRecord): void {
+    this.history.push(r);
+    if (this.history.length > Otak.HISTORY_LIMIT) this.history.shift();
+    if (r.source === 'llm') {
+      this.counts.llm += 1;
+      if (r.overrode) this.counts.overrides += 1;
+    } else {
+      this.counts.heuristic += 1;
+    }
+  }
+
   /** Sliding-window budget so a stuck loop cannot burn the API quota. */
   private withinBudget(): boolean {
     const cutoff = Date.now() - 3_600_000;
@@ -102,8 +157,22 @@ export class Otak {
   async decide(req: OtakRequest): Promise<OtakDecision> {
     const fallback = heuristicPick(req);
 
-    if (!this.enabled) return fallback;
-    if (req.candidates.length <= 1) return fallback; // nothing to re-rank
+    if (!this.enabled || req.candidates.length <= 1) {
+      // Nothing to re-rank, or the brain is off: still recorded, so the
+      // history shows what the fleet is doing either way.
+      this.record({
+        at: Date.now(),
+        domain: req.domain,
+        source: 'heuristic',
+        heuristicChoice: fallback.chosenId,
+        chosenId: fallback.chosenId,
+        overrode: false,
+        confidence: fallback.confidence,
+        reasoning: fallback.reasoning,
+        candidateCount: req.candidates.length,
+      });
+      return fallback;
+    }
     if (!this.withinBudget()) {
       log.warn(`otak budget exhausted (${this.opts.maxCallsPerHour}/h) — using heuristic`);
       return fallback;
@@ -138,6 +207,7 @@ export class Otak {
         log.warn(
           `provider ${p.name} returned unknown id "${reply.chosenId}" — rejected, using heuristic`,
         );
+        this.counts.rejected += 1;
         return fallback;
       }
 
@@ -155,6 +225,26 @@ export class Otak {
         detail: 'decided',
         checkedAt: Date.now(),
       });
+
+      const overrode = reply.chosenId !== fallback.chosenId;
+      this.record({
+        at: Date.now(),
+        domain: req.domain,
+        source: 'llm',
+        provider: p.name,
+        heuristicChoice: fallback.chosenId,
+        chosenId: reply.chosenId,
+        overrode,
+        confidence: reply.confidence,
+        reasoning: reply.reasoning,
+        candidateCount: req.candidates.length,
+      });
+
+      log.info(
+        `otak/${p.name} ${req.domain}: ${overrode ? 'OVERRODE' : 'agreed with'} heuristic ` +
+          `(${fallback.chosenId} -> ${reply.chosenId}) conf=${reply.confidence.toFixed(2)} — ` +
+          `${reply.reasoning.slice(0, 100)}`,
+      );
 
       return {
         chosenId: reply.chosenId,

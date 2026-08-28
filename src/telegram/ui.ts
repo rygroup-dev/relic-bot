@@ -299,6 +299,76 @@ export interface OtakView {
   preferred: string;
 }
 
+export interface DecisionView {
+  at: number;
+  domain: string;
+  source: 'heuristic' | 'llm';
+  provider?: string;
+  heuristicChoice: string | null;
+  chosenId: string | null;
+  overrode: boolean;
+  confidence: number;
+  reasoning: string;
+  candidateCount: number;
+}
+
+/**
+ * What the brain actually did.
+ *
+ * The override rate is the honest measure of value: a model that never moves
+ * off the heuristic pick is spending tokens without changing behaviour, and
+ * that should be visible rather than hidden behind a green light.
+ */
+export function renderDecisions(
+  rows: readonly DecisionView[],
+  stats: { llm: number; heuristic: number; overrides: number; rejected: number; overrideRate: number },
+): string {
+  const out = [...header('🧠', 'Otak decisions', 'most recent first')];
+
+  out.push(
+    '',
+    `🤖 <b>${stats.llm}</b> by model   ⚙️ <b>${stats.heuristic}</b> by heuristics`,
+    `🔀 <b>${stats.overrides}</b> overrides  (<b>${Math.round(stats.overrideRate * 100)}%</b> of model calls)`,
+  );
+  if (stats.rejected > 0) {
+    out.push(`🛡 <b>${stats.rejected}</b> invented answers rejected by the guardrail`);
+  }
+
+  if (rows.length === 0) {
+    out.push(
+      '',
+      ...footnote(
+        'No decisions yet. Otak is only consulted when a wallet is',
+        'actually playing and there are at least two options to rank.',
+      ),
+    );
+    return out.join('\n');
+  }
+
+  for (const r of rows) {
+    const icon = r.source === 'llm' ? (r.overrode ? '🔀' : '✅') : '⚙️';
+    const who = r.source === 'llm' ? (r.provider ?? 'llm') : 'heuristic';
+    out.push(
+      '',
+      `${icon} <b>${esc(r.domain)}</b> · ${esc(who)} · ${esc(relTime(r.at))}`,
+      `     chose ${code(r.chosenId ?? 'nothing')} of ${r.candidateCount}`,
+    );
+    if (r.overrode) {
+      out.push(`     <i>instead of ${esc(r.heuristicChoice ?? 'nothing')}</i>`);
+    }
+    if (r.reasoning) out.push(`     <i>${esc(r.reasoning.slice(0, 110))}</i>`);
+  }
+
+  out.push(
+    '',
+    ...footnote(
+      '🔀 the model changed the outcome · ✅ it agreed',
+      '⚙️ decided without the model at all',
+    ),
+  );
+  return out.join('\n');
+}
+
 export function renderOtak(v: OtakView): string {
   const out = [
     '<b>🧠 Otak — the decision brain</b>',
