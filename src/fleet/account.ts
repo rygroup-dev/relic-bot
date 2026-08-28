@@ -24,7 +24,13 @@ import {
   parseCandidateId,
   DEFAULT_COMBAT_TUNING,
 } from '../game/combat.js';
-import { readEntities, readSelf, describeUnknownState, type SelfView } from '../game/state.js';
+import {
+  readEntities,
+  readSelf,
+  describeUnknownState,
+  type SelfView,
+  type EntityView,
+} from '../game/state.js';
 import {
   characterIntents,
   intentsToCandidates,
@@ -100,6 +106,16 @@ export class AccountRunner {
   private signals = new SignalState();
   /** Session id of the dungeon room, known only once the join completes. */
   private dungeonSessionId: string | null = null;
+  private dungeonDumped = false;
+  /**
+   * Dungeon room state, kept separate from the town's.
+   *
+   * The town connection stays open during a run and keeps pushing its own
+   * state. Sharing one field meant town state overwrote dungeon state between
+   * ticks, so the bot read town's 6 idle players and empty `mobs` collection
+   * and concluded there was nothing to fight — inside a dungeon full of mobs.
+   */
+  private dungeonState: unknown = null;
 
   /**
    * Every message from the dungeon room.
@@ -123,8 +139,13 @@ export class AccountRunner {
         this.note = 'died in the dungeon';
       } else {
         // A death that is not ours is a kill — the only kill evidence there is.
+        // The death payload carries an id but not always a name, so resolve it
+        // against the mob still in state: per-monster win rates are what drive
+        // target selection, and "unknown" makes that memory useless.
+        const id = (payload as { id?: unknown } | null)?.id;
+        const named = typeof id === 'string' ? this.mobName(id) : null;
         for (const monster of this.signals.drainKills()) {
-          this.d.combat.record(this.account.id, monster, 'win');
+          this.d.combat.record(this.account.id, named ?? monster, 'win');
         }
       }
     }
@@ -336,6 +357,8 @@ export class AccountRunner {
       let finished = false;
 
       this.dungeonSessionId = room.sessionId;
+      this.dungeonDumped = false;
+      this.dungeonState = null;
 
       for (const type of VALUE_SIGNALS) {
         room.onMessage(type, (payload: unknown) => {
@@ -354,7 +377,14 @@ export class AccountRunner {
         finished = true;
       });
       room.onStateChange((st) => {
-        this.latestState = st;
+        this.dungeonState = st;
+        if (!this.dungeonDumped) {
+          this.dungeonDumped = true;
+          // One-time shape dump. The dungeon state is a different schema from
+          // town, and guessing at it is how the distance filter silently
+          // excluded every target.
+          this.log.debug(`dungeon state shape:\n${describeUnknownState(st, 3, 40)}`);
+        }
       });
       room.onLeave(() => {
         finished = true;
@@ -512,6 +542,57 @@ export class AccountRunner {
     return outcome.ran && outcome.value === true;
   }
 
+  /** Resolve a mob id to its display name using the last dungeon state. */
+  private mobName(id: string): string | null {
+    for (const e of readEntities(this.dungeonState)) {
+      if (e.kind === 'monster' && e.id === id && e.name && e.name !== 'mobs') return e.name;
+    }
+    return null;
+  }
+
+  /**
+   * Step toward the nearest living mob.
+   *
+   * Moves in a straight line rather than pathfinding: the dungeon is
+   * procedural and no collision map is published for it, so a BFS would be
+   * guessing at walls. The server refuses illegal moves and reports where we
+   * really are via `s.move.denied`, which is better truth than a map we do
+   * not have.
+   */
+  private approachNearestMob(
+    room: { send: (t: string, p?: unknown) => void },
+    self: SelfView,
+    entities: readonly EntityView[],
+  ): boolean {
+    if (!self.pos) return false;
+
+    const alive = entities.filter(
+      (e) => e.kind === 'monster' && e.pos && (e.hp === null || e.hp > 0),
+    );
+    if (alive.length === 0) return false;
+
+    const me = self.pos;
+    const dist = (e: EntityView): number => Math.hypot(e.pos!.x - me.x, e.pos!.y - me.y);
+    const nearest = alive.reduce((a, b) => (dist(b) < dist(a) ? b : a));
+
+    // A server-supplied resync always wins over our own dead reckoning.
+    const resync = this.signals.takeResync();
+    const from = resync ?? { col: Math.round(me.x), row: Math.round(me.y) };
+
+    const target = nearest.pos!;
+    const dx = Math.sign(target.x - from.col);
+    const dy = Math.sign(target.y - from.row);
+    if (dx === 0 && dy === 0) return false;
+
+    // One step per tick keeps pace with the server's own movement rate.
+    room.send(MSG.MOVE, { col: from.col + dx, row: from.row + dy, seq: ++this.moveSeq });
+    this.note =
+      `approaching ${nearest.name} — ` +
+      `${Math.round(Math.hypot(target.x - from.col, target.y - from.row))} cells away`;
+    return true;
+  }
+
+
   /**
    * Inventory, from the `s.inv.sync` signal.
    *
@@ -586,11 +667,10 @@ export class AccountRunner {
       return;
     }
 
-    const entities = readEntities(this.latestState);
-    // The dungeon room has its own session id. Passing null here made readSelf
-    // return an empty view every tick, so the bot could not see its own HP —
-    // which silently disabled the survival gate, potions and retreat entirely.
-    const self = readSelf(this.latestState, sessionId);
+    const entities = readEntities(this.dungeonState);
+    // The dungeon room has its own session id AND its own state. Reading the
+    // shared field gave town's view; reading with a null id gave nothing.
+    const self = readSelf(this.dungeonState, sessionId);
 
     // An incoming attack telegraph is the one moment where moving beats
     // attacking. Roll first, ask questions after.
@@ -660,7 +740,14 @@ export class AccountRunner {
       DEFAULT_COMBAT_TUNING,
     );
     if (targets.length === 0) {
-      this.note = 'dungeon: nothing engageable';
+      // Nothing in reach does not mean nothing to do. A dungeon floor is much
+      // larger than the engage radius, so the bot has to close the distance
+      // rather than stand still waiting for mobs to wander over.
+      const approached = this.approachNearestMob(room, self, entities);
+      if (!approached) {
+        const mobs = entities.filter((e) => e.kind === 'monster');
+        this.note = `no reachable mob (${mobs.length} on the floor)`;
+      }
       return;
     }
 

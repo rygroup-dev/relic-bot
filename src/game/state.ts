@@ -113,7 +113,12 @@ export function readEntities(state: unknown): EntityView[] {
       out.push({
         id: String(pick(v, ['id', 'sessionId', 'entityId']) ?? id),
         kind: classify(collectionKey, v),
-        name: String(pick(v, ['name', 'label', 'displayName', 'monsterId']) ?? collectionKey),
+        // Dungeon mobs carry displayName / hoverName rather than `name`,
+        // verified from a live dungeon state dump.
+        name: String(
+          pick(v, ['name', 'displayName', 'hoverName', 'label', 'monsterId', 'charId']) ??
+            collectionKey,
+        ),
         pos,
         hp,
         maxHp: num(pick(v, ['maxHp', 'hpMax', 'maxHealth'])),
@@ -168,14 +173,18 @@ export function distance(a: Vec2, b: Vec2): number {
 
 /** First-run diagnostic: dump the observed state shape so the accessors above
  *  can be tightened against reality rather than assumption. */
-export function describeUnknownState(state: unknown, maxDepth = 2): string {
+export function describeUnknownState(
+  state: unknown,
+  maxDepth = 2,
+  maxKeys = 5,
+): string {
   const seen = new WeakSet<object>();
   const walk = (v: unknown, depth: number): unknown => {
     if (v === null || typeof v !== 'object') return typeof v;
     if (seen.has(v as object)) return '<circular>';
     seen.add(v as object);
     if (depth >= maxDepth) return Array.isArray(v) ? `array[${v.length}]` : 'object';
-    const entries = iterCollection(v).slice(0, 5);
+    const entries = iterCollection(v).slice(0, maxKeys);
     const o: Record<string, unknown> = {};
     for (const [k, val] of entries) o[k] = walk(val, depth + 1);
     return o;
