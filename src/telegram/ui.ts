@@ -321,7 +321,14 @@ export interface DecisionView {
  */
 export function renderDecisions(
   rows: readonly DecisionView[],
-  stats: { llm: number; heuristic: number; overrides: number; rejected: number; overrideRate: number },
+  stats: {
+    llm: number;
+    heuristic: number;
+    overrides: number;
+    rejected: number;
+    overrideRate: number;
+    skipped?: number;
+  },
 ): string {
   const out = [...header('🧠', 'Otak decisions', 'most recent first')];
 
@@ -332,6 +339,11 @@ export function renderDecisions(
   );
   if (stats.rejected > 0) {
     out.push(`🛡 <b>${stats.rejected}</b> invented answers rejected by the guardrail`);
+  }
+  if (stats.skipped) {
+    // Distinguishes "the brain is off" from "the brain is on but never gets a
+    // real choice" — otherwise a quiet screen looks like a broken one.
+    out.push(`⏭ <b>${stats.skipped}</b> skipped — only one option, nothing to rank`);
   }
 
   if (rows.length === 0) {

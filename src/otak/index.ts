@@ -80,6 +80,8 @@ export class Otak {
   private history: DecisionRecord[] = [];
   private static readonly HISTORY_LIMIT = 40;
   private counts = { llm: 0, heuristic: 0, overrides: 0, rejected: 0 };
+  /** Decisions that never reached the model because there was nothing to rank. */
+  private skipped = 0;
 
   constructor(private opts: OtakOptions) {}
 
@@ -131,9 +133,10 @@ export class Otak {
     overrides: number;
     rejected: number;
     overrideRate: number;
+    skipped: number;
   } {
     const rate = this.counts.llm === 0 ? 0 : this.counts.overrides / this.counts.llm;
-    return { ...this.counts, overrideRate: rate };
+    return { ...this.counts, overrideRate: rate, skipped: this.skipped };
   }
 
   private record(r: DecisionRecord): void {
@@ -156,6 +159,18 @@ export class Otak {
 
   async decide(req: OtakRequest): Promise<OtakDecision> {
     const fallback = heuristicPick(req);
+
+    // Visibility: without this it is impossible to tell "the brain is off"
+    // from "the brain is on but never gets a real choice to make".
+    if (this.enabled && req.candidates.length <= 1) {
+      this.skipped += 1;
+      if (this.skipped % 25 === 1) {
+        log.info(
+          `otak on, but ${this.skipped} decision(s) had ${req.candidates.length} candidate(s) — ` +
+            `nothing to re-rank yet`,
+        );
+      }
+    }
 
     if (!this.enabled || req.candidates.length <= 1) {
       // Nothing to re-rank, or the brain is off: still recorded, so the

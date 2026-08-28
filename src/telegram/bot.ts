@@ -931,6 +931,17 @@ export class ControlBot {
       this.rebuildProviders();
       const next = !this.fleet.otak.enabled;
       this.fleet.otak.setEnabled(next);
+
+      // Persist it. The toggle used to live only in memory, so any restart
+      // silently turned the brain back off while the operator believed it was
+      // still on — a setting you cannot trust is worse than no setting.
+      try {
+        persistEnvValue(join(process.cwd(), '.env'), 'OTAK_ENABLED', String(next));
+        this.cfg.OTAK_ENABLED = next;
+      } catch (e) {
+        log.warn(`could not persist the otak toggle: ${(e as Error).message}`);
+      }
+
       await ctx.answerCallbackQuery({ text: next ? 'Otak ON' : 'Otak OFF' });
       return this.viewOtak(ctx);
     });
