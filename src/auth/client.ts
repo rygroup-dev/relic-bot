@@ -13,6 +13,7 @@ import { RestClient, ApiError } from '../net/rest.js';
 import { EP } from '../protocol/endpoints.js';
 import { buildLoginMessage } from '../wallet/signer.js';
 import type { Account } from '../wallet/keystore.js';
+import { authLimiter, isRateLimited } from '../net/ratelimit.js';
 import { logger } from '../log.js';
 
 const log = logger('auth');
@@ -83,16 +84,23 @@ export class AuthClient {
     };
 
     try {
-      res = await this.rest.post(EP.AUTH_VERIFY, {
-        deviceId: account.deviceId,
-        walletType: 'phantom',
-        proof: {
-          walletAddress: account.address,
-          message,
-          signature,
-          timestamp,
-        },
-      });
+      // Every login in the process shares one gate: the rate limit belongs to
+      // the server, so spacing wallet starts alone never fixed the bursts that
+      // reconnects and restarts produce.
+      res = await authLimiter.run(
+        () =>
+          this.rest.post(EP.AUTH_VERIFY, {
+            deviceId: account.deviceId,
+            walletType: 'phantom',
+            proof: {
+              walletAddress: account.address,
+              message,
+              signature,
+              timestamp,
+            },
+          }),
+        isRateLimited,
+      );
     } catch (err) {
       if (err instanceof ApiError) {
         const body = err.body as { error?: string; ban?: BanInfo } | null;

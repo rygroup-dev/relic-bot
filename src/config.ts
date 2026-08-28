@@ -27,7 +27,9 @@ const Schema = z.object({
 
   // --- fleet pacing ---
   FLEET_MAX_CONCURRENT: num(10),
-  FLEET_START_STAGGER_MS: num(20_000),
+  // Wallet starts are spread this far apart. Raising it reduces the auth burst
+  // at boot; the shared authLimiter handles every other source of bursts.
+  FLEET_START_STAGGER_MS: num(45_000),
   ACTION_TEMPO_MS: num(1_400),
   ACTION_JITTER_PCT: num(35),
 

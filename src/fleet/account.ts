@@ -24,6 +24,12 @@ import {
   DEFAULT_COMBAT_TUNING,
 } from '../game/combat.js';
 import { readEntities, readSelf, describeUnknownState, type SelfView } from '../game/state.js';
+import {
+  characterIntents,
+  intentsToCandidates,
+  type ActionIntent,
+  type InventoryItem,
+} from '../game/actions.js';
 import { loadWorldMap, dungeonEntrance, findPath, type Cell } from '../game/world.js';
 import { logger, type Logger } from '../log.js';
 import type { Config } from '../config.js';
@@ -362,10 +368,117 @@ export class AccountRunner {
     return target;
   }
 
+  /**
+   * Non-combat upkeep: potions, abilities, equipment, attributes, chests.
+   *
+   * Runs before combat every tick and works with the LLM off — Otak only
+   * reorders the intents the heuristics already produced.
+   */
+  private async upkeep(
+    send: (t: string, p?: unknown) => void,
+    self: SelfView,
+    entities: readonly ReturnType<typeof readEntities>[number][],
+    targetId: string | null,
+  ): Promise<boolean> {
+    const intents = characterIntents(self, this.inventory(), entities, {
+      classId: (this.session?.character?.classId as never) ?? null,
+      targetId,
+      abilities: this.abilities(),
+      unspentPoints: this.unspentPoints(),
+    });
+    if (intents.length === 0) return false;
+
+    const outcome = await free(this.d.parks, this.account.id, 'upkeep', async () => {
+      const decision = await this.d.otak.decide({
+        domain: 'progression',
+        situation: `hp=${self.hp ?? '?'}/${self.maxHp ?? '?'} mana=${self.mana ?? '?'}/${self.maxMana ?? '?'}`,
+        candidates: intentsToCandidates(intents),
+      });
+      const idx = decision.chosenId ? Number(decision.chosenId.split(':')[1]) : 0;
+      const chosen: ActionIntent | undefined = intents[Number.isFinite(idx) ? idx : 0];
+      if (!chosen) return false;
+      this.note = chosen.label;
+      send(chosen.type, chosen.payload);
+      return true;
+    });
+    return outcome.ran && outcome.value === true;
+  }
+
+  /** Inventory as the action layer expects it, read defensively from state. */
+  private inventory(): InventoryItem[] {
+    const state = this.latestState;
+    if (!state || typeof state !== 'object') return [];
+    const rec = state as Record<string, unknown>;
+    const inv = rec.inventory ?? rec.items;
+    if (!inv || typeof inv !== 'object') return [];
+
+    const out: InventoryItem[] = [];
+    for (const [key, v] of Object.entries(inv as Record<string, unknown>)) {
+      if (!v || typeof v !== 'object') continue;
+      const r = v as Record<string, unknown>;
+      const name = typeof r.name === 'string' ? r.name : null;
+      if (!name) continue;
+      const item: InventoryItem = { name };
+      if (typeof r.instanceId === 'string') item.instanceId = r.instanceId;
+      item.itemId = typeof r.itemId === 'string' ? r.itemId : key;
+      if (typeof r.slot === 'string') item.slot = r.slot;
+      if (typeof r.rarity === 'string') item.rarity = r.rarity;
+      if (typeof r.quantity === 'number') item.quantity = r.quantity;
+      if (typeof r.equipped === 'boolean') item.equipped = r.equipped;
+      if (typeof r.consumable === 'boolean') item.consumable = r.consumable;
+      // The server does not label what a potion restores, so infer from the
+      // name rather than inventing a field that is not there.
+      if (item.consumable) {
+        item.restores = /mana|spirit|ether/i.test(name)
+          ? 'mana'
+          : /health|heal|life|hp/i.test(name)
+            ? 'hp'
+            : null;
+      }
+      out.push(item);
+    }
+    return out;
+  }
+
+  /** Abilities exposed on the player record, if any. */
+  private abilities(): { abilityId: string; name?: string; manaCost?: number; readyAt?: number }[] {
+    const self = readSelf(this.latestState, this.zone?.sessionId ?? null);
+    const raw = (self as unknown as { raw?: Record<string, unknown> }).raw;
+    const list = raw?.abilities ?? raw?.spells;
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((a): a is Record<string, unknown> => Boolean(a) && typeof a === 'object')
+      .map((a) => {
+        const out: { abilityId: string; name?: string; manaCost?: number; readyAt?: number } = {
+          abilityId: String(a.abilityId ?? a.id ?? ''),
+        };
+        if (typeof a.name === 'string') out.name = a.name;
+        if (typeof a.manaCost === 'number') out.manaCost = a.manaCost;
+        if (typeof a.readyAt === 'number') out.readyAt = a.readyAt;
+        return out;
+      })
+      .filter((a) => a.abilityId.length > 0);
+  }
+
+  private unspentPoints(): number {
+    const state = this.latestState;
+    if (!state || typeof state !== 'object') return 0;
+    const players = (state as Record<string, unknown>).players;
+    const me = players && typeof players === 'object'
+      ? (players as Record<string, unknown>)[this.zone?.sessionId ?? '']
+      : null;
+    const n = (me as Record<string, unknown> | null)?.unspentPoints;
+    return typeof n === 'number' && n > 0 ? Math.floor(n) : 0;
+  }
+
   /** One decision inside a dungeon, where the mobs actually are. */
   private async dungeonTick(room: { send: (t: string, p?: unknown) => void }): Promise<void> {
     const entities = readEntities(this.latestState);
     const self = readSelf(this.latestState, null);
+
+    // Stay alive and geared before picking a fight.
+    const target = entities.find((e) => e.kind === 'monster')?.id ?? null;
+    if (await this.upkeep((t, p) => room.send(t, p), self, entities, target)) return;
 
     const loot = lootCandidates(self, entities);
     if (loot.length > 0) {
