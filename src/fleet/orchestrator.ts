@@ -43,6 +43,7 @@ export class Fleet {
   readonly otak: Otak;
 
   private runners: AccountRunner[] = [];
+  private rescanTimer: NodeJS.Timeout | null = null;
   /** Grades events so only what matters reaches Telegram. */
   private readonly notifier = new Notifier();
   private authFailures = 0;
@@ -177,19 +178,71 @@ export class Fleet {
 
     // Stagger starts so N sessions do not authenticate in the same second.
     for (const [i, runner] of this.runners.entries()) {
-      const delay = i * this.cfg.FLEET_START_STAGGER_MS;
-      void (async () => {
-        if (delay > 0) await sleep(delay);
-        if (!this.running) return;
-        await runner.run();
-      })();
+      this.launch(runner, i * this.cfg.FLEET_START_STAGGER_MS);
     }
+
+    // A wallet minted from Telegram used to sit unused until the process was
+    // restarted, because the key directory was read exactly once. Rescan
+    // periodically so a new wallet joins on its own.
+    this.rescanTimer = setInterval(() => void this.rescan(), 60_000);
+    this.rescanTimer.unref?.();
 
     log.info(`fleet started (${this.runners.length} accounts)`);
   }
 
+  private launch(runner: AccountRunner, delayMs: number): void {
+    void (async () => {
+      if (delayMs > 0) await sleep(delayMs);
+      if (!this.running) return;
+      await runner.run();
+    })();
+  }
+
+  /**
+   * Pick up wallets added since start.
+   *
+   * Only genuinely new keys are launched, and the concurrency ceiling still
+   * applies — a directory full of keys must not silently become a hundred
+   * simultaneous logins.
+   */
+  private async rescan(): Promise<void> {
+    if (!this.running) return;
+
+    let onDisk: Account[];
+    try {
+      onDisk = loadFleet(this.cfg.RELIC_KEYS_DIR);
+    } catch (err) {
+      log.debug(`rescan skipped: ${(err as Error).message}`);
+      return;
+    }
+
+    const known = new Set(this.runners.map((r) => r.account.id));
+    const max = Math.max(1, Math.floor(this.cfg.FLEET_MAX_CONCURRENT));
+    const room = max - this.runners.length;
+    if (room <= 0) return;
+
+    const fresh = onDisk.filter((a) => !known.has(a.id)).slice(0, room);
+    if (fresh.length === 0) return;
+
+    log.info(`rescan found ${fresh.length} new wallet(s) — starting them`);
+    for (const [i, account] of fresh.entries()) {
+      const runner = new AccountRunner(account, this.deps);
+      this.runners.push(runner);
+      // Stagger newcomers too; a batch minted at once would otherwise all
+      // authenticate in the same second.
+      this.launch(runner, i * this.cfg.FLEET_START_STAGGER_MS);
+    }
+
+    void this.alert({
+      kind: 'character_created',
+      text: `${fresh.length} new wallet(s) joined the fleet: ${fresh.map((a) => a.id).join(', ')}`,
+    });
+  }
+
   async stop(): Promise<void> {
     this.running = false;
+    if (this.rescanTimer) clearInterval(this.rescanTimer);
+    this.rescanTimer = null;
     this.watchdog.stop();
     await Promise.allSettled(this.runners.map((r) => r.stop()));
     log.info('fleet stopped');

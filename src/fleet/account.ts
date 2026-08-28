@@ -35,6 +35,13 @@ import { loadWorldMap, dungeonEntrance, findPath, type Cell } from '../game/worl
 import { logger, type Logger } from '../log.js';
 import type { Config } from '../config.js';
 
+/**
+ * Below this fraction of max HP the bot stops trading hits and tries to
+ * survive instead. A wipe forfeits the entire run's loot, so the expected cost
+ * of one more kill attempt is much higher than it looks.
+ */
+export const CRITICAL_HP_FRACTION = 0.35;
+
 export type AccountPhase =
   | 'idle'
   | 'authenticating'
@@ -332,9 +339,36 @@ export class AccountRunner {
       });
 
       const started = Date.now();
+      let diedAt = 0;
+      let lastProgress = Date.now();
+      let lastLedger = this.d.ledger.lastValueAt(this.account.id);
+
       while (!this.stopping && !finished && Date.now() - started < 20 * 60_000) {
-        await this.dungeonTick(room);
+        await this.dungeonTick(room, room.sessionId);
         await this.tempo();
+
+        // Death used to leave the loop spinning for the full 20 minutes waiting
+        // for a summary that may never arrive — the wallet produced nothing and
+        // reported no error, which is exactly the failure mode the watchdog
+        // exists to catch. Give the server a moment to send the summary, then go.
+        if (this.signals.dead) {
+          if (diedAt === 0) diedAt = Date.now();
+          if (Date.now() - diedAt > 15_000) {
+            this.log.info('died — leaving the run rather than idling');
+            break;
+          }
+          continue;
+        }
+
+        // A run that produces nothing for minutes is stuck, not unlucky.
+        const now = this.d.ledger.lastValueAt(this.account.id);
+        if (now > lastLedger) {
+          lastLedger = now;
+          lastProgress = Date.now();
+        } else if (Date.now() - lastProgress > 5 * 60_000) {
+          this.log.warn('no value for 5m inside the run — abandoning it');
+          break;
+        }
       }
 
       await room.leave(true).catch(() => {});
@@ -520,7 +554,10 @@ export class AccountRunner {
   }
 
   /** One decision inside a dungeon, where the mobs actually are. */
-  private async dungeonTick(room: { send: (t: string, p?: unknown) => void }): Promise<void> {
+  private async dungeonTick(
+    room: { send: (t: string, p?: unknown) => void },
+    sessionId: string | null,
+  ): Promise<void> {
     // A dead hero cannot act; hammering the server changes nothing.
     if (this.signals.dead) {
       this.note = 'dead — waiting for the run to end';
@@ -528,13 +565,50 @@ export class AccountRunner {
     }
 
     const entities = readEntities(this.latestState);
-    const self = readSelf(this.latestState, null);
+    // The dungeon room has its own session id. Passing null here made readSelf
+    // return an empty view every tick, so the bot could not see its own HP —
+    // which silently disabled the survival gate, potions and retreat entirely.
+    const self = readSelf(this.latestState, sessionId);
 
     // An incoming attack telegraph is the one moment where moving beats
     // attacking. Roll first, ask questions after.
     if (this.signals.underTelegraph()) {
       this.note = 'dodging a telegraphed attack';
       room.send(MSG.ROLL, {});
+      return;
+    }
+
+    // Survival gate. Fighting on at low HP with nothing to drink is how a run
+    // ends in `wiped` — and a wipe forfeits the whole run's loot, which costs
+    // far more than the kills it would have bought.
+    const hpFrac =
+      self.hp !== null && self.maxHp !== null && self.maxHp > 0 ? self.hp / self.maxHp : null;
+
+    if (hpFrac !== null && hpFrac <= CRITICAL_HP_FRACTION) {
+      const potion = this.inventory().find(
+        (i) => i.consumable && i.restores === 'hp' && (i.quantity ?? 1) > 0 && i.itemId,
+      );
+      if (potion?.itemId) {
+        this.note = `critical ${Math.round(hpFrac * 100)}% hp — drinking ${potion.name}`;
+        room.send(MSG.USE, { itemId: potion.itemId });
+        return;
+      }
+
+      // Nothing to drink: back away from the nearest threat instead of trading
+      // hits we cannot win.
+      const threat = entities.find((e) => e.kind === 'monster' && e.pos);
+      if (threat?.pos && self.pos) {
+        const dx = Math.sign(self.pos.x - threat.pos.x) || 1;
+        const dy = Math.sign(self.pos.y - threat.pos.y) || 1;
+        this.note = `critical ${Math.round(hpFrac * 100)}% hp, no potion — retreating`;
+        room.send(MSG.MOVE, {
+          col: Math.round(self.pos.x + dx * 2),
+          row: Math.round(self.pos.y + dy * 2),
+          seq: ++this.moveSeq,
+        });
+        return;
+      }
+      this.note = `critical ${Math.round(hpFrac * 100)}% hp — holding`;
       return;
     }
 
