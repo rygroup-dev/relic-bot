@@ -46,6 +46,16 @@ export interface AccountStatus {
   battles: number;
   listings: number;
   note: string;
+  /** Live character vitals, when the wallet is in a room. */
+  vitals: {
+    hp: number | null;
+    maxHp: number | null;
+    mana: number | null;
+    maxMana: number | null;
+    level: number | null;
+    gold: number | null;
+    depth: number | null;
+  };
 }
 
 export interface AccountDeps {
@@ -90,6 +100,21 @@ export class AccountRunner {
       battles: this.d.combat.totalBattles(this.account.id),
       listings: this.listings,
       note: this.note,
+      vitals: this.vitals(),
+    };
+  }
+
+  /** Read vitals straight from the latest room state. */
+  private vitals(): AccountStatus['vitals'] {
+    const s = readSelf(this.latestState, this.zone?.sessionId ?? null);
+    return {
+      hp: s.hp,
+      maxHp: s.maxHp,
+      mana: s.mana,
+      maxMana: s.maxMana,
+      level: s.level,
+      gold: s.gold,
+      depth: s.depth,
     };
   }
 
@@ -351,7 +376,7 @@ export class AccountRunner {
       });
       const parsed = d.chosenId ? parseCandidateId(d.chosenId) : null;
       if (parsed) {
-        room.send(MSG.LOOT_PICKUP, { id: parsed.target });
+        room.send(MSG.LOOT_PICKUP, { dropId: parsed.target });
         return;
       }
     }
@@ -379,7 +404,11 @@ export class AccountRunner {
       return;
     }
     this.note = `attacking ${parsed.target} (${d.source})`;
-    room.send(MSG.ATTACK, { targetId: parsed.target });
+    room.send(MSG.ATTACK, {
+      targetId: parsed.target,
+      fromCol: self.pos ? Math.round(self.pos.x) : undefined,
+      fromRow: self.pos ? Math.round(self.pos.y) : undefined,
+    });
   }
 
   /** Server messages we can attribute value to. */
@@ -426,7 +455,7 @@ export class AccountRunner {
         if (!decision.chosenId) return false;
         const parsed = parseCandidateId(decision.chosenId);
         if (!parsed) return false;
-        zone.send(MSG.LOOT_PICKUP, { id: parsed.target });
+        zone.send(MSG.LOOT_PICKUP, { dropId: parsed.target });
         return true;
       });
       if (outcome.ran && outcome.value) return;
@@ -459,7 +488,11 @@ export class AccountRunner {
       const parsed = parseCandidateId(decision.chosenId);
       if (!parsed) return;
       this.note = `attacking ${parsed.target} (${decision.source})`;
-      zone.send(MSG.ATTACK, { targetId: parsed.target });
+      zone.send(MSG.ATTACK, {
+        targetId: parsed.target,
+        fromCol: self.pos ? Math.round(self.pos.x) : undefined,
+        fromRow: self.pos ? Math.round(self.pos.y) : undefined,
+      });
     });
   }
 

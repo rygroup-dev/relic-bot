@@ -165,16 +165,19 @@ export class ControlBot {
     text: string,
     kb: InlineKeyboard = ControlBot.backRow(),
   ): Promise<void> {
+    // Telegram rejects anything over 4096 chars outright, so every view is
+    // trimmed at a line boundary rather than failing to send at all.
+    const body = ui.fit(text);
     const payload = { parse_mode: 'HTML' as const, reply_markup: kb };
     if (ctx.callbackQuery) {
       try {
-        await ctx.editMessageText(text, payload);
+        await ctx.editMessageText(body, payload);
         return;
       } catch {
         // Editing fails when the content is identical or too old; fall through.
       }
     }
-    await ctx.reply(text, payload);
+    await ctx.reply(body, payload);
   }
 
   // ---------------------------------------------------------------- views --
@@ -231,10 +234,28 @@ export class ControlBot {
       kb.text('⭐ Set main', 'wal:main').text('🔑 Export key', 'wal:export').row();
     }
 
+    // Read each wallet's own live state rather than showing a flat list: the
+    // fleet already knows each one's phase and whether it is stuck without a job.
+    const live = new Map(this.fleet.status().map((r) => [r.id, r]));
+
     await this.show(
       ctx,
       ui.renderWallets(
-        members.map((m) => ({ id: m.id, address: m.address, isMain: m.address === mainAddr })),
+        members.map((m) => {
+          const st = live.get(m.id);
+          const row: ui.WalletRow = {
+            id: m.id,
+            address: m.address,
+            isMain: m.address === mainAddr,
+          };
+          if (st) {
+            row.phase = st.phase;
+            // `no_character` is reported through the park note, so a wallet
+            // that never got a job is visible without an extra round trip.
+            if (/no_character|no job/i.test(st.note)) row.hasCharacter = false;
+          }
+          return row;
+        }),
       ),
       ControlBot.backRow(kb),
     );
@@ -637,7 +658,10 @@ export class ControlBot {
       await ctx.answerCallbackQuery();
       const members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
       const kb = new InlineKeyboard();
-      for (const m of members) kb.text(m.id, `wal:setmain:${m.id}`).row();
+      for (const m of members) {
+        const data = `wal:setmain:${m.id}`;
+        if (ui.callbackFits(data)) kb.text(m.id, data).row();
+      }
       await this.show(
         ctx,
         '<b>⭐ Choose the main account</b>\n\nSweeps collect into this wallet, and gas is funded from it.',
@@ -676,7 +700,10 @@ export class ControlBot {
       await ctx.answerCallbackQuery();
       const members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
       const kb = new InlineKeyboard();
-      for (const m of members) kb.text(`🔑 ${m.id}`, `wal:exp:${m.id}`).row();
+      for (const m of members) {
+        const data = `wal:exp:${m.id}`;
+        if (ui.callbackFits(data)) kb.text(`🔑 ${m.id}`, data).row();
+      }
       await this.show(
         ctx,
         [

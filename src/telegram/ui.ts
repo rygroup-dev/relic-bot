@@ -14,6 +14,33 @@ import type { SweepReport } from '../wallet/treasury.js';
 import { fmtAmount, fmtSol } from '../wallet/treasury.js';
 import { formatRelic } from '../economy/gate.js';
 
+/**
+ * Telegram hard limits. A message over 4096 characters is rejected outright,
+ * and callback_data over 64 bytes is silently truncated by the client — both
+ * surface only once a fleet grows, which is exactly when you least want the
+ * control surface to break.
+ */
+export const TG_MAX_MESSAGE = 4096;
+export const TG_MAX_CALLBACK = 64;
+
+/**
+ * Trim a rendered view to fit, cutting at a line boundary and saying how much
+ * was hidden rather than letting Telegram reject the whole message.
+ */
+export function fit(text: string, limit = TG_MAX_MESSAGE): string {
+  if (text.length <= limit) return text;
+  const notice = '\n\n<i>… truncated — use the CLI for the full list.</i>';
+  const budget = limit - notice.length;
+  const cut = text.slice(0, budget);
+  const lastBreak = cut.lastIndexOf('\n');
+  return (lastBreak > budget * 0.6 ? cut.slice(0, lastBreak) : cut) + notice;
+}
+
+/** True when callback data is short enough for Telegram to round-trip intact. */
+export function callbackFits(data: string): boolean {
+  return Buffer.byteLength(data, 'utf8') <= TG_MAX_CALLBACK;
+}
+
 /** Escape the five characters Telegram's HTML mode treats specially. */
 export function esc(s: unknown): string {
   return String(s ?? '')
@@ -44,6 +71,20 @@ export function relTime(ts: number, now = Date.now()): string {
   return `${Math.round(h / 24)}d ago`;
 }
 
+/** Consistent chrome so every view reads as one product, not ten screens. */
+export const RULE = '━━━━━━━━━━━━━━━';
+
+export function header(icon: string, title: string, subtitle?: string): string[] {
+  const out = [`${icon}  <b>${esc(title)}</b>`];
+  if (subtitle) out.push(`<i>${esc(subtitle)}</i>`);
+  out.push(RULE);
+  return out;
+}
+
+export function footnote(...lines: string[]): string[] {
+  return [RULE, ...lines.map((l) => `<i>${l}</i>`)];
+}
+
 const PHASE_ICON: Record<string, string> = {
   idle: '⚪',
   authenticating: '🔑',
@@ -58,10 +99,58 @@ export function phaseIcon(phase: string): string {
   return PHASE_ICON[phase] ?? '⚪';
 }
 
+/** A small text meter. Reads at a glance in a chat window. */
+export function bar(cur: number | null, max: number | null, width = 10): string {
+  if (cur === null || max === null || max <= 0) return '·'.repeat(width);
+  const frac = Math.max(0, Math.min(1, cur / max));
+  const filled = Math.round(frac * width);
+  return '█'.repeat(filled) + '░'.repeat(width - filled);
+}
+
+export function pct(cur: number | null, max: number | null): string {
+  if (cur === null || max === null || max <= 0) return '?';
+  return `${Math.round((cur / max) * 100)}%`;
+}
+
+export interface Vitals {
+  hp: number | null;
+  maxHp: number | null;
+  mana: number | null;
+  maxMana: number | null;
+  level: number | null;
+  gold: number | null;
+  depth: number | null;
+}
+
+/** HP and Mana are the only pools this game has — no stamina or energy. */
+export function renderVitals(v: Vitals | undefined | null, indent = '     '): string[] {
+  // A wallet that has not joined a room yet has no vitals at all; that is a
+  // normal state, not a reason to fail rendering the whole fleet view.
+  if (!v) return [];
+  const out: string[] = [];
+  if (v.hp !== null || v.maxHp !== null) {
+    out.push(`${indent}❤️ ${bar(v.hp, v.maxHp)} ${esc(pct(v.hp, v.maxHp))}` +
+      (v.hp !== null && v.maxHp !== null ? `  <i>${v.hp}/${v.maxHp}</i>` : ''));
+  }
+  if (v.mana !== null || v.maxMana !== null) {
+    out.push(`${indent}🔷 ${bar(v.mana, v.maxMana)} ${esc(pct(v.mana, v.maxMana))}` +
+      (v.mana !== null && v.maxMana !== null ? `  <i>${v.mana}/${v.maxMana}</i>` : ''));
+  }
+  const meta: string[] = [];
+  if (v.level !== null) meta.push(`⭐ lv${v.level}`);
+  if (v.depth !== null) meta.push(`🕳 depth ${v.depth}`);
+  if (v.gold !== null) meta.push(`🪙 ${v.gold}`);
+  if (meta.length > 0) out.push(`${indent}${meta.join('   ')}`);
+  return out;
+}
+
 /** The fleet overview. */
 export function renderStatus(rows: readonly AccountStatus[], now = Date.now()): string {
   if (rows.length === 0) {
-    return '<b>Fleet</b>\n\nNo accounts are running.\n\nAdd a wallet with <b>Wallets → New</b>.';
+    return (
+      '<b>⚔️ Fleet</b>\n\nNo accounts are running.\n\n' +
+      'Add one from <b>👛 Wallets</b>, then give it a job.'
+    );
   }
 
   const playing = rows.filter((r) => r.phase === 'playing').length;
@@ -71,31 +160,28 @@ export function renderStatus(rows: readonly AccountStatus[], now = Date.now()): 
   const listed = rows.reduce((s, r) => s + r.listings, 0);
 
   const out: string[] = [
-    '<b>⚔️ Fleet status</b>',
+    ...header('⚔️', 'Fleet', `${rows.length} wallet${rows.length === 1 ? '' : 's'} under management`),
     '',
-    `${rows.length} wallet${rows.length === 1 ? '' : 's'} · ` +
-      `🟢 ${playing} playing · 🟡 ${parked} parked${banned ? ` · 🔴 ${banned} banned` : ''}`,
-    `${battles} battle${battles === 1 ? '' : 's'} · ${listed} listing${listed === 1 ? '' : 's'} created`,
-    '',
-    '───────────────',
+    `🟢 <b>${playing}</b> playing   🟡 <b>${parked}</b> parked` +
+      (banned ? `   🔴 <b>${banned}</b> banned` : ''),
+    `⚔️ <b>${battles}</b> battles   🏷️ <b>${listed}</b> listed`,
   ];
 
   for (const r of rows) {
-    const gate =
-      r.gate === null ? '· gate ?' : r.gate.allowed ? '· gate 🔓 open' : '· gate 🔒 closed';
+    const gate = r.gate === null ? '❔' : r.gate.allowed ? '🔓' : '🔒';
     out.push(
       '',
-      `${phaseIcon(r.phase)} <b>${esc(r.id)}</b>  <i>${esc(r.phase)}</i> ${gate}`,
-      `   ${code(shortAddr(r.address))}`,
-      `   battles <b>${r.battles}</b> · listed <b>${r.listings}</b> · value ${esc(relTime(r.lastValueAt, now))}`,
+      `${phaseIcon(r.phase)} <b>${esc(r.id)}</b>  ·  ${esc(r.phase)}  ·  ${gate}`,
+      `     ${code(shortAddr(r.address))}`,
+      `     ⚔️ ${r.battles}   🏷️ ${r.listings}   ⏱ ${esc(relTime(r.lastValueAt, now))}`,
+      ...renderVitals(r.vitals),
     );
-    if (r.note) out.push(`   <i>${esc(r.note.slice(0, 120))}</i>`);
+    if (r.note) out.push(`     <i>${esc(r.note.slice(0, 110))}</i>`);
   }
 
   out.push(
     '',
-    '───────────────',
-    '<i>Liveness is measured by produced value, not by absence of errors.</i>',
+    ...footnote('Liveness is measured by produced value,', 'never by the absence of errors.'),
   );
   return out.join('\n');
 }
@@ -154,25 +240,25 @@ export interface HoldingRow {
 }
 
 export function renderHoldings(rows: readonly HoldingRow[]): string {
-  const out = ['<b>💰 Holdings</b>', ''];
+  const out = [...header('💰', 'Holdings', 'read live from chain')];
   for (const r of rows) {
     out.push(
-      `${r.isMain ? '⭐' : '•'} <b>${esc(r.id)}</b>${r.isMain ? ' <i>(main)</i>' : ''}`,
-      `   ${code(shortAddr(r.address))}`,
-      `   ◎ ${esc(fmtSol(r.sol))} SOL`,
+      '',
+      `${r.isMain ? '⭐' : '👛'} <b>${esc(r.id)}</b>${r.isMain ? '  <i>main</i>' : ''}`,
+      `     ${code(shortAddr(r.address))}`,
+      `     ◎ <b>${esc(fmtSol(r.sol))}</b> SOL`,
     );
     if (r.tokens.length === 0) {
-      out.push('   <i>no token balances</i>');
+      out.push('     <i>no tokens</i>');
     } else {
       for (const t of r.tokens) {
         out.push(
-          `   ${esc(fmtAmount(t.amount, t.decimals))} ${esc(t.label ?? shortAddr(t.mint))}`,
+          `     💎 <b>${esc(fmtAmount(t.amount, t.decimals))}</b> ${esc(t.label ?? shortAddr(t.mint))}`,
         );
       }
     }
-    out.push('');
   }
-  out.push('<i>Sweeps move everything into the main wallet ⭐.</i>');
+  out.push('', ...footnote('Sweeps move everything into ⭐.'));
   return out.join('\n');
 }
 
@@ -243,18 +329,51 @@ export function renderOtak(v: OtakView): string {
   return out.join('\n');
 }
 
-export function renderWallets(
-  rows: readonly { id: string; address: string; isMain: boolean }[],
-): string {
+export interface WalletRow {
+  id: string;
+  address: string;
+  isMain: boolean;
+  /** Live phase from the running fleet, when this wallet is being run. */
+  phase?: string;
+  /** Whether the fleet has seen a character for it. */
+  hasCharacter?: boolean;
+}
+
+export function renderWallets(rows: readonly WalletRow[]): string {
   if (rows.length === 0) {
-    return '<b>👛 Wallets</b>\n\nNone yet. Use <b>New</b> or <b>Import</b> below.';
+    return [
+      ...header('👛', 'Wallets', 'none yet'),
+      '',
+      'Mint one with <b>➕</b>, or bring your own with <b>📥 Import</b>.',
+      '',
+      ...footnote('Keys are written 0600 into a 0700 directory,', 'outside the repository.'),
+    ].join('\n');
   }
-  const out = ['<b>👛 Wallets</b>', ''];
+
+  const out = [
+    ...header('👛', 'Wallets', `${rows.length} loaded`),
+  ];
+
   for (const r of rows) {
-    out.push(`${r.isMain ? '⭐' : '•'} <b>${esc(r.id)}</b>${r.isMain ? ' <i>(main)</i>' : ''}`);
-    out.push(`   ${code(r.address)}`);
+    const mark = r.isMain ? '⭐' : '👛';
+    const bits: string[] = [];
+    if (r.phase) bits.push(`${phaseIcon(r.phase)} ${r.phase}`);
+    if (r.hasCharacter === false) bits.push('🎭 no job');
+    out.push(
+      '',
+      `${mark} <b>${esc(r.id)}</b>${r.isMain ? '  <i>main</i>' : ''}`,
+      `     ${code(r.address)}`,
+    );
+    if (bits.length > 0) out.push(`     ${esc(bits.join('  ·  '))}`);
   }
-  out.push('', '<i>⭐ is the main account — sweeps collect here.</i>');
+
+  out.push(
+    '',
+    ...footnote(
+      '⭐ is the main account — sweeps collect here',
+      'and gas is funded from it.',
+    ),
+  );
   return out.join('\n');
 }
 

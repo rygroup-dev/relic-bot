@@ -34,8 +34,14 @@ export interface SelfView {
   pos: Vec2 | null;
   hp: number | null;
   maxHp: number | null;
+  /** The game has HP and Mana only — no stamina, energy or MP pool exists. */
+  mana: number | null;
+  maxMana: number | null;
   level: number | null;
+  xp: number | null;
   gold: number | null;
+  /** Current dungeon depth, when inside a run. */
+  depth: number | null;
 }
 
 function num(v: unknown): number | null {
@@ -120,19 +126,36 @@ export function readEntities(state: unknown): EntityView[] {
 }
 
 export function readSelf(state: unknown, sessionId: string | null): SelfView {
-  const empty: SelfView = { id: sessionId, pos: null, hp: null, maxHp: null, level: null, gold: null };
+  const empty: SelfView = {
+    id: sessionId,
+    pos: null,
+    hp: null,
+    maxHp: null,
+    mana: null,
+    maxMana: null,
+    level: null,
+    xp: null,
+    gold: null,
+    depth: null,
+  };
   if (!state || typeof state !== 'object' || !sessionId) return empty;
 
   for (const [, collection] of Object.entries(state as Record<string, unknown>)) {
     for (const [k, v] of iterCollection(collection)) {
       if (k !== sessionId) continue;
+      // Field names verified against the client's own reads in the bundle:
+      // hp, maxHp, mana, maxMana, level, xp, gold, depth.
       return {
         id: sessionId,
         pos: readPos(v),
         hp: num(pick(v, ['hp', 'health', 'currentHp'])),
         maxHp: num(pick(v, ['maxHp', 'hpMax', 'maxHealth'])),
+        mana: num(pick(v, ['mana', 'mp', 'currentMana'])),
+        maxMana: num(pick(v, ['maxMana', 'manaMax', 'maxMp'])),
         level: num(pick(v, ['level', 'lvl'])),
+        xp: num(pick(v, ['xp', 'experience'])),
         gold: num(pick(v, ['gold', 'coins'])),
+        depth: num(pick(v, ['depth', 'runDepth'])),
       };
     }
   }

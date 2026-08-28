@@ -168,3 +168,62 @@ describe('prompt rendering is compact and secret-free', () => {
     for (const l of lines) expect(l.length).toBeLessThan(90);
   });
 });
+
+describe('one brain drives the whole fleet, and OFF is not degraded', () => {
+  const many: OtakRequest = {
+    domain: 'combat',
+    situation: 'three targets',
+    candidates: [
+      { id: 'attack:a', label: 'troll', score: 0.3, rationale: 'far' },
+      { id: 'attack:b', label: 'rat', score: 0.8, rationale: 'near, wounded' },
+      { id: 'attack:c', label: 'ogre', score: 0.5, rationale: 'mid' },
+    ],
+  };
+
+  it('serves every wallet from a single instance', async () => {
+    // The fleet constructs one Otak and hands the same reference to every
+    // AccountRunner, so enabling it lights up all wallets at once — existing
+    // and newly minted alike.
+    const o = new Otak(opts);
+    o.setProviders([stub('anthropic', { chosenId: 'attack:c' })]);
+
+    const perWallet = await Promise.all(
+      ['wallet-01', 'wallet-02', 'wallet-03'].map(() => o.decide(many)),
+    );
+    for (const d of perWallet) {
+      expect(d.source).toBe('llm');
+      expect(d.chosenId).toBe('attack:c');
+    }
+  });
+
+  it('still decides on every wallet with the brain switched off', async () => {
+    const o = new Otak({ ...opts, enabled: false });
+    for (const _ of ['wallet-01', 'wallet-02', 'wallet-03']) {
+      const d = await o.decide(many);
+      // Same shape of answer, same action space — just chosen by the
+      // deterministic policy instead of the model.
+      expect(d.chosenId).toBe('attack:b');
+      expect(d.source).toBe('heuristic');
+    }
+  });
+
+  it('can only ever pick from what the heuristics already offered', async () => {
+    // This is the boundary of "more powerful": the model re-ranks, it does not
+    // gain new abilities. Anything outside the candidate set is discarded.
+    const o = new Otak(opts);
+    o.setProviders([stub('anthropic', { chosenId: 'attack:dragon-not-offered' })]);
+    const d = await o.decide(many);
+    expect(d.source).toBe('heuristic');
+    expect(many.candidates.map((c) => c.id)).toContain(d.chosenId);
+  });
+
+  it('toggles at runtime without restarting the fleet', async () => {
+    const o = new Otak({ ...opts, enabled: false });
+    o.setProviders([stub('openai', { chosenId: 'attack:c' })]);
+    expect((await o.decide(many)).source).toBe('heuristic');
+    o.setEnabled(true);
+    expect((await o.decide(many)).source).toBe('llm');
+    o.setEnabled(false);
+    expect((await o.decide(many)).source).toBe('heuristic');
+  });
+});

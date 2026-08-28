@@ -106,6 +106,44 @@ export const ROOM = {
 export type RoomName = (typeof ROOM)[keyof typeof ROOM];
 
 /**
+ * Exact client->server payload shapes, read from the production bundle's
+ * `send*` wrappers. Getting a field name wrong here fails silently: the server
+ * ignores the message and the bot loops producing nothing at zero errors.
+ *
+ *   i.move          { col, row, seq }
+ *   i.attack        { targetId, fromCol, fromRow }
+ *   i.loot.pickup   { dropId }           <- NOT { id }
+ *   i.chest.open    { chestId }
+ *   i.use           { itemId }
+ *   i.inv.equip     { instanceId, slot }
+ *   i.inv.unequip   { slot }
+ *   i.attrs.set     { alloc: {...} }
+ *   i.shop.buy      { merchantId, itemId, quantity }
+ *   i.pos.killsettle{ col, row }
+ *   i.descend.req   {}
+ */
+export const PAYLOAD_NOTE = 'see bundle send* wrappers' as const;
+
+/** The five allocatable attributes, from `allocatedAttributes` in the bundle. */
+export const ATTRIBUTES = [
+  'vitality',
+  'strength',
+  'dexterity',
+  'intelligence',
+  'spirit',
+] as const;
+
+export type Attribute = (typeof ATTRIBUTES)[number];
+
+export const ATTRIBUTE_ICON: Record<Attribute, string> = {
+  vitality: '❤️',
+  strength: '💪',
+  dexterity: '🏃',
+  intelligence: '🧠',
+  spirit: '✨',
+};
+
+/**
  * Playable classes, from the character-select scene in the production bundle
  * (`fg = [{classId:"hunter"}, ...]`).
  *

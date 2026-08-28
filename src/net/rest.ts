@@ -44,11 +44,35 @@ export interface RestOptions {
   allowUnauthenticated?: boolean;
 }
 
+/**
+ * Request headers matching a real browser session.
+ *
+ * Taken from an actual capture of the game client rather than invented, so the
+ * platform hints, UA and fetch metadata agree with each other — a Linux UA
+ * paired with Windows client hints is more conspicuous than either alone.
+ *
+ * This only makes the HTTP surface consistent. It does not make automation
+ * undetectable: timing regularity, uptime and repeated pathing are what
+ * actually distinguish a bot, which is why the fleet jitters its tempo.
+ */
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+
+const CLIENT_HINTS: Readonly<Record<string, string>> = {
+  'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'sec-fetch-dest': 'empty',
+  'sec-fetch-mode': 'cors',
+  'sec-fetch-site': 'same-origin',
+  'accept-language': 'en-US,en;q=0.9',
+};
+
 export class RestClient {
   constructor(
     private readonly baseUrl: string,
-    private readonly userAgent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+    private readonly userAgent = process.env.RELIC_USER_AGENT || BROWSER_UA,
   ) {}
 
   async request<T = unknown>(path: string, opts: RestOptions = {}): Promise<T> {
@@ -63,6 +87,7 @@ export class RestClient {
       'user-agent': this.userAgent,
       origin: this.baseUrl,
       referer: `${this.baseUrl}/`,
+      ...CLIENT_HINTS,
     };
     if (token) headers.authorization = `Bearer ${token}`;
     if (body !== undefined) headers['content-type'] = 'application/json';

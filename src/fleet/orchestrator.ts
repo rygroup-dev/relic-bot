@@ -23,13 +23,15 @@ import { Otak } from '../otak/index.js';
 import { GateChecker } from '../economy/gate.js';
 import { Marketplace } from '../economy/marketplace.js';
 import { AccountRunner, type AccountStatus } from './account.js';
+import { Notifier, detectSuspicious, type EventKind } from '../safety/notify.js';
 import { logger } from '../log.js';
 
 const log = logger('fleet');
 
 export interface FleetAlert {
-  kind: 'silence' | 'park' | 'ban';
+  kind: EventKind;
   text: string;
+  accountId?: string;
 }
 
 export type AlertSink = (alert: FleetAlert) => void | Promise<void>;
@@ -41,6 +43,9 @@ export class Fleet {
   readonly otak: Otak;
 
   private runners: AccountRunner[] = [];
+  /** Grades events so only what matters reaches Telegram. */
+  private readonly notifier = new Notifier();
+  private authFailures = 0;
   private watchdog: Watchdog;
   private alertSinks: AlertSink[] = [];
   private running = false;
@@ -80,11 +85,12 @@ export class Fleet {
 
     this.parks.onPark((entry) => {
       if (!entry.needsOperator) return;
+      const kind: EventKind =
+        entry.key === 'banned' ? 'ban' : entry.scope === 'fleet' ? 'fleet_park' : 'account_park';
       void this.alert({
-        kind: entry.key === 'banned' ? 'ban' : 'park',
-        text:
-          `PARK ${entry.scope}${entry.accountId ? `/${entry.accountId}` : ''} ` +
-          `"${entry.key}": ${entry.reason}`,
+        kind,
+        text: `${entry.key}: ${entry.reason}`,
+        ...(entry.accountId ? { accountId: entry.accountId } : {}),
       });
     });
   }
@@ -96,6 +102,13 @@ export class Fleet {
   }
 
   private async alert(a: FleetAlert): Promise<void> {
+    // Grade before sending: a channel full of routine noise stops being read,
+    // and then a real alert goes unnoticed too.
+    const event = { kind: a.kind, text: a.text, ...(a.accountId ? { accountId: a.accountId } : {}) };
+    if (!this.notifier.shouldSend(event)) {
+      log.debug(`suppressed ${a.kind}: ${a.text.slice(0, 80)}`);
+      return;
+    }
     for (const s of this.alertSinks) {
       try {
         await s(a);
@@ -117,6 +130,18 @@ export class Fleet {
         `${reports.length} account(s) producing NOTHING despite zero errors:\n` +
         lines.join('\n'),
     });
+
+    // Everything connected but nothing produced across the whole fleet is the
+    // signature of a protocol change, not of bad luck.
+    const suspicion = detectSuspicious({
+      refusalRate: 0,
+      authFailures: this.authFailures,
+      silentAccounts: reports.length,
+      totalAccounts: this.runners.length,
+    });
+    if (suspicion) {
+      void this.alert({ kind: 'suspicious', text: suspicion });
+    }
   }
 
   accounts(): Account[] {
