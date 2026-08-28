@@ -35,6 +35,8 @@ import { CLASSES, CLASS_ICON, type ClassId } from '../protocol/messages.js';
 import { RestClient } from '../net/rest.js';
 import { AuthClient } from '../auth/client.js';
 import { loadAccount } from '../wallet/keystore.js';
+import { generateName } from '../game/names.js';
+import { readRelicBalance } from '../economy/gate.js';
 import * as ui from './ui.js';
 import { redact, logger } from '../log.js';
 
@@ -60,6 +62,8 @@ export class ControlBot {
   private bot: Bot;
   private keys: OtakKeyStore;
   private pending = new Map<number, Pending>();
+  /** Last suggested hero name per wallet+class, so a tap confirms what was shown. */
+  private suggested = new Map<string, string>();
 
   constructor(
     private readonly opts: TelegramOptions,
@@ -291,7 +295,7 @@ export class ControlBot {
     const auth = new AuthClient(rest);
     const account = loadAccount(join(this.cfg.RELIC_KEYS_DIR, `${walletId}.key`));
     const session = await auth.login(account);
-    return { auth, session };
+    return { auth, session, account };
   }
 
   private async viewCharacterWallets(ctx: Context): Promise<void> {
@@ -317,10 +321,14 @@ export class ControlBot {
   }
 
   private async viewCharacters(ctx: Context, walletId: string): Promise<void> {
-    await this.show(ctx, '<i>Loading roster…</i>', new InlineKeyboard());
+    await this.show(ctx, '<i>Loading roster and balance…</i>', new InlineKeyboard());
     try {
-      const { auth, session } = await this.sessionFor(walletId);
+      const { auth, session, account } = await this.sessionFor(walletId);
       const { characters, unlocks } = await auth.roster(session.token);
+
+      // Detect the wallet's actual on-chain RELIC, so a locked class can say
+      // how far off it is rather than just "locked".
+      const relic = await readRelicBalance(this.connection(), account.address).catch(() => null);
 
       const owned = new Map(characters.map((c) => [String(c.classId ?? ''), c]));
       const rows = CLASSES.map((classId) => {
@@ -339,14 +347,48 @@ export class ControlBot {
       const kb = new InlineKeyboard();
       for (const r of rows) {
         if (r.owned) continue;
-        kb.text(`${r.icon} Create ${r.classId}${r.unlocked ? '' : ' 🔒'}`, `chr:new:${walletId}:${r.classId}`).row();
+        kb.text(
+          `${r.icon} ${r.classId}${r.unlocked ? ' 🆓' : ' 🔒'}`,
+          `chr:pick:${walletId}:${r.classId}`,
+        ).row();
       }
-      kb.text('‹ Wallets', 'nav:chars').row();
+      kb.text('🔄 Refresh', `chr:w:${walletId}`).text('‹ Wallets', 'nav:chars').row();
 
-      await this.show(ctx, ui.renderCharacters(walletId, rows), ControlBot.backRow(kb));
+      await this.show(
+        ctx,
+        ui.renderCharacters(walletId, rows, { address: account.address, relicBaseUnits: relic }),
+        ControlBot.backRow(kb),
+      );
     } catch (err) {
       await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
     }
+  }
+
+  /** Class chosen: offer a generated name, or let the operator type one. */
+  private async viewNamePick(ctx: Context, walletId: string, classId: ClassId): Promise<void> {
+    const suggested = generateName(classId);
+    this.suggested.set(`${walletId}:${classId}`, suggested);
+
+    await this.show(
+      ctx,
+      [
+        `<b>${CLASS_ICON[classId]} ${ui.esc(classId)} — ${ui.esc(walletId)}</b>`,
+        '',
+        'Suggested name:',
+        `<b>${ui.esc(suggested)}</b>`,
+        '',
+        '⚠️ <b>The name is permanent.</b> The game does not allow renaming.',
+      ].join('\n'),
+      ControlBot.backRow(
+        new InlineKeyboard()
+          .text('✅ Use this name', `chr:go:${walletId}:${classId}`)
+          .row()
+          .text('🎲 Another', `chr:pick:${walletId}:${classId}`)
+          .text('✏️ Type my own', `chr:new:${walletId}:${classId}`)
+          .row()
+          .text('‹ Roster', `chr:w:${walletId}`),
+      ),
+    );
   }
 
   private async createCharacter(
@@ -510,14 +552,17 @@ export class ControlBot {
         const made = n === 1
           ? [createWallet(this.cfg.RELIC_KEYS_DIR)]
           : createWallets(this.cfg.RELIC_KEYS_DIR, n);
+
+        const kb = new InlineKeyboard();
+        for (const w of made) kb.text(`🎭 Pick job — ${w.id}`, `chr:w:${w.id}`).row();
+        kb.text('🔑 Back up keys', 'wal:export').row();
+
         await this.show(
           ctx,
-          ui.renderMinted(made),
-          ControlBot.backRow(
-            new InlineKeyboard()
-              .text('👛 Wallets', 'nav:wallets')
-              .text('🔑 Back up keys', 'wal:export'),
-          ),
+          ui.renderMinted(made) +
+            '\n\n<b>Next: give each wallet a job.</b>\n' +
+            '<i>A wallet without a character cannot enter the world.</i>',
+          ControlBot.backRow(kb),
         );
       } catch (err) {
         await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
@@ -636,6 +681,19 @@ export class ControlBot {
     this.bot.callbackQuery(/^chr:w:(.+)$/, async (ctx) => {
       await ctx.answerCallbackQuery();
       return this.viewCharacters(ctx, ctx.match![1]!);
+    });
+
+    this.bot.callbackQuery(/^chr:pick:([^:]+):(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      return this.viewNamePick(ctx, ctx.match![1]!, ctx.match![2] as ClassId);
+    });
+
+    this.bot.callbackQuery(/^chr:go:([^:]+):(.+)$/, async (ctx) => {
+      const walletId = ctx.match![1]!;
+      const classId = ctx.match![2] as ClassId;
+      await ctx.answerCallbackQuery({ text: 'creating…' });
+      const name = this.suggested.get(`${walletId}:${classId}`) ?? generateName(classId);
+      await this.createCharacter(ctx, walletId, classId, name);
     });
 
     this.bot.callbackQuery(/^chr:new:([^:]+):(.+)$/, async (ctx) => {

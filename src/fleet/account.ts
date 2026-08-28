@@ -127,7 +127,27 @@ export class AccountRunner {
       }
       if (this.stopping) break;
       this.phase = 'parked';
-      await sleep(30_000);
+
+      // Read the park we just wrote. Without this the loop re-authenticates
+      // every 30s forever on a refusal that retrying can never fix (an
+      // indefinitely parked `no_character` wallet was doing exactly that, and
+      // the resulting auth storm rate-limited the whole fleet).
+      let waited = 0;
+      for (;;) {
+        if (this.stopping) return;
+        const blocked = this.d.parks.blocking(this.account.id, 'session');
+        if (!blocked) break;
+        if (blocked.needsOperator && !Number.isFinite(blocked.until)) {
+          // Nothing will change without a human. Sit still and stay quiet.
+          this.note = `waiting for operator: ${blocked.reason.slice(0, 90)}`;
+          await sleep(30_000);
+          continue;
+        }
+        await sleep(5_000);
+        waited += 5_000;
+        if (waited > 10 * 60_000) break; // safety valve against a stuck park
+      }
+      await sleep(5_000);
     }
   }
 

@@ -198,7 +198,9 @@ npm run ctl -- listings               current marketplace listings
 npm run ctl -- ledger                 produced value per wallet
 
 # wallet management
-npm run ctl -- new [id]               generate a wallet
+npm run ctl -- new [id]               generate a wallet + hero
+npm run ctl -- new --count N          up to 10 wallets, each with a hero
+npm run ctl -- onboard                hero for every character-less wallet
 npm run ctl -- import <key> [id]      import a base58 or JSON key
 npm run ctl -- export <id>            print as solana-keygen JSON (SECRET)
 npm run ctl -- main [id]              show or set the main account
@@ -213,14 +215,43 @@ npm run ctl -- fund  [--execute]      top up wallets low on gas
 There is deliberately no `buy` command, and no command that can send to an
 address outside your fleet.
 
+### Characters
+
+A wallet with no character cannot enter the world at all — the server refuses
+the join with `no_character` — so minting a wallet is only half the job.
+`relicctl new` and the Telegram mint buttons therefore create a hero
+automatically, paced because `/api/auth/verify` rate-limits aggressively.
+
+Six classes exist: 🏹 hunter · 🔮 mage · 💀 necromancer · 🛡️ knight ·
+🗡️ assassin · 🎭 rogue.
+
+**Which ones a wallet may use is decided by the server**, via the `unlocks`
+array on `/api/characters`; a gated class rejects with `token_required`, which
+is the RELIC-holding requirement surfacing. Nothing about that split is
+hardcoded here — the roster view shows 🆓 or 🔒 based on what the server
+actually answered for that wallet.
+
+Names are generated per class from separate vocabularies, so a necromancer
+never ends up called "Sunwarden". Every candidate is validated against the
+client's own rules — the `/^[A-Za-z0-9][A-Za-z0-9 _'-]{0,18}[A-Za-z0-9]$/`
+regex, the 2–20 length bound, and its profanity screen — before it is used,
+because **the game states hero names are permanent**.
+
+```
+npm run ctl -- new --count 5     # 5 wallets, each with a hero
+npm run ctl -- new --no-hero     # wallet only
+npm run ctl -- onboard           # give every character-less wallet a hero
+```
+
 ### Telegram
 
 Send `/menu` for a button interface: fleet status, holdings, wallets, token
 gate, Otak, parks, sweep and gas funding. Anything that moves funds runs as a
 dry run first and needs a second confirmation tap before it broadcasts.
 
-Wallets can be created, imported, and exported (as `solana-keygen` JSON) from
-chat. An exported key self-deletes after 90 seconds, and every inbound secret —
+Wallets can be minted in batches (+1 / +5 / +10, capped so a mis-tap cannot
+produce hundreds of keys), imported, and exported (as `solana-keygen` JSON) from
+chat. Every freshly minted wallet gets a hero automatically. An exported key self-deletes after 90 seconds, and every inbound secret —
 an imported key, an API key — is deleted the moment it arrives.
 
 The bot ignores every chat not in `TELEGRAM_OWNER_IDS`; an empty allowlist
@@ -232,7 +263,7 @@ means nobody, not everybody.
 
 ```bash
 npm install
-npm test          # 107 tests
+npm test          # 128 tests
 npm run typecheck
 npm run build
 ```

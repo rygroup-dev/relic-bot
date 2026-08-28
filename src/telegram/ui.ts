@@ -282,6 +282,40 @@ export function renderMinted(
   return out.join('\n');
 }
 
+/** Result of auto-creating heroes for freshly minted wallets. */
+export function renderOnboard(
+  results: readonly {
+    walletId: string;
+    ok: boolean;
+    classId?: string;
+    name?: string;
+    reason?: string;
+    alreadyHad?: boolean;
+  }[],
+): string {
+  const good = results.filter((r) => r.ok);
+  const bad = results.filter((r) => !r.ok);
+  const out = [`<b>🎭 Heroes: ${good.length}/${results.length} ready</b>`, ''];
+
+  for (const r of good) {
+    out.push(
+      `✅ <b>${esc(r.walletId)}</b> — ${esc(r.classId ?? '?')} ` +
+        `“<b>${esc(r.name ?? '?')}</b>”${r.alreadyHad ? ' <i>(existing)</i>' : ''}`,
+    );
+  }
+  for (const r of bad) {
+    out.push(`⚠️ <b>${esc(r.walletId)}</b> — ${esc((r.reason ?? 'failed').slice(0, 110))}`);
+  }
+
+  if (good.length > 0) {
+    out.push('', '<i>Tap Clear parks and these wallets will enter the world.</i>');
+  }
+  if (bad.some((r) => /RELIC/i.test(r.reason ?? ''))) {
+    out.push('', '<i>🔒 means that class needs RELIC held on that wallet.</i>');
+  }
+  return out.join('\n');
+}
+
 export interface CharacterRow {
   classId: string;
   icon: string;
@@ -291,24 +325,51 @@ export interface CharacterRow {
   level?: number;
 }
 
-/** Character roster with the free/gated split made explicit. */
-export function renderCharacters(wallet: string, rows: readonly CharacterRow[]): string {
-  const out = [`<b>🎭 Characters — ${esc(wallet)}</b>`, ''];
+export interface WalletBalance {
+  address: string;
+  relicBaseUnits: bigint | null;
+}
+
+/** Character roster, with the free/gated split and the wallet's real balance. */
+export function renderCharacters(
+  wallet: string,
+  rows: readonly CharacterRow[],
+  balance?: WalletBalance,
+): string {
+  const out = [`<b>🎭 Jobs — ${esc(wallet)}</b>`, ''];
+
+  if (balance) {
+    const held =
+      balance.relicBaseUnits === null
+        ? '<i>unreadable</i>'
+        : `<b>${esc(formatRelic(balance.relicBaseUnits))} RELIC</b>`;
+    out.push(`${code(shortAddr(balance.address))} · holding ${held}`, '');
+  }
+
+  const locked = rows.filter((r) => !r.owned && !r.unlocked).length;
+
   for (const r of rows) {
     const state = r.owned
-      ? `✅ owned${r.name ? ` — <b>${esc(r.name)}</b>` : ''}${r.level ? ` lv${r.level}` : ''}`
+      ? `✅ owned — <b>${esc(r.name ?? 'unnamed')}</b>${r.level ? ` lv${r.level}` : ''}`
       : r.unlocked
-        ? '🆓 available'
-        : '🔒 locked — needs RELIC held';
+        ? '🆓 free — tap to create'
+        : '🔒 locked';
     out.push(`${r.icon} <b>${esc(r.classId)}</b> · ${state}`);
   }
+
+  out.push('', '───────────────');
+
+  if (locked > 0) {
+    out.push(
+      `🔒 <b>${locked} job${locked === 1 ? '' : 's'} locked.</b> These need RELIC held on`,
+      'this wallet — the game rejects them with <code>token_required</code>.',
+      '',
+    );
+  }
   out.push(
-    '',
-    '───────────────',
-    '<i>🆓 classes can be created now. 🔒 classes reject with</i>',
-    '<i>token_required until the wallet holds enough RELIC.</i>',
-    '<i>The threshold is server-side, so this reflects what the</i>',
-    '<i>server actually reported for this wallet.</i>',
+    '<i>The exact threshold is enforced server-side and is not published,</i>',
+    '<i>so this shows what the server actually reported for this wallet</i>',
+    '<i>rather than a hardcoded number.</i>',
   );
   return out.join('\n');
 }

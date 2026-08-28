@@ -13,6 +13,7 @@ import { setLogLevel } from './log.js';
 import { loadFleet } from './wallet/keystore.js';
 import {
   createWallet,
+  createWallets,
   importWallet,
   exportWalletJson,
   fleetMembers,
@@ -20,6 +21,8 @@ import {
   persistMainAccount,
 } from './wallet/manage.js';
 import { Treasury, fmtSol, fmtAmount, type SweepReport } from './wallet/treasury.js';
+import { onboardBatch } from './game/onboard.js';
+import { loadAccount } from './wallet/keystore.js';
 import { RestClient } from './net/rest.js';
 import { AuthClient } from './auth/client.js';
 import { GateChecker, formatRelic, readRelicBalance } from './economy/gate.js';
@@ -81,7 +84,9 @@ function usage(): void {
       '  ledger                 summarise produced value per wallet',
       '',
       'wallet management',
-      '  new [id]               generate a new wallet',
+      '  new [id]               generate a wallet (and a hero for it)',
+      '  new --count N          generate up to 10 wallets, each with a hero',
+      '  onboard                give every character-less wallet a hero',
       '  import <key> [id]      import a base58 or JSON secret key',
       '  export <id>            print a wallet as solana-keygen JSON  (SECRET)',
       '  main [id]              show or set the main account',
@@ -189,9 +194,55 @@ async function main(): Promise<void> {
 
     // ------------------------------------------------- wallet management --
     case 'new': {
-      const w = createWallet(cfg.RELIC_KEYS_DIR, argv[1]);
-      console.log(`created ${w.id}\n  address ${w.address}\n  file    ${w.path} (0600)`);
-      console.log('\nBack up the key file. If you lose it, the wallet is gone.');
+      const ci = argv.indexOf('--count');
+      const count = ci >= 0 ? Number(argv[ci + 1]) : 1;
+      const explicitId = ci >= 0 ? undefined : argv[1];
+
+      const made =
+        count > 1
+          ? createWallets(cfg.RELIC_KEYS_DIR, count)
+          : [createWallet(cfg.RELIC_KEYS_DIR, explicitId)];
+
+      for (const w of made) {
+        console.log(`created ${w.id}\n  address ${w.address}\n  file    ${w.path} (0600)`);
+      }
+      console.log('\nBack up the key files. If you lose them, the wallets are gone.\n');
+
+      if (flag('no-hero')) {
+        console.log('--no-hero given: skipping character creation.');
+        break;
+      }
+
+      // A wallet without a character cannot enter the world, so create one.
+      console.log('creating heroes (paced — auth rate-limits)…\n');
+      const results = await onboardBatch(
+        auth,
+        made.map((w) => loadAccount(w.path)),
+        { taken: new Set<string>() },
+      );
+      for (const r of results) {
+        console.log(
+          r.ok
+            ? `  ok   ${r.walletId.padEnd(14)} ${r.classId} "${r.name}"` +
+                (r.alreadyHad ? ' (existing)' : '')
+            : `  FAIL ${r.walletId.padEnd(14)} ${r.reason}`,
+        );
+      }
+      break;
+    }
+
+    case 'onboard': {
+      const accounts = loadFleet(cfg.RELIC_KEYS_DIR);
+      console.log(`onboarding ${accounts.length} wallet(s), paced…\n`);
+      const results = await onboardBatch(auth, accounts, { taken: new Set<string>() });
+      for (const r of results) {
+        console.log(
+          r.ok
+            ? `  ok   ${r.walletId.padEnd(14)} ${r.classId} "${r.name}"` +
+                (r.alreadyHad ? ' (existing)' : '')
+            : `  FAIL ${r.walletId.padEnd(14)} ${r.reason}`,
+        );
+      }
       break;
     }
 
