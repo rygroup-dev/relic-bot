@@ -86,7 +86,7 @@ function usage(): void {
       'wallet management',
       '  new [id]               generate a wallet (and a hero for it)',
       '  new --count N          generate up to 10 wallets, each with a hero',
-      '  onboard                give every character-less wallet a hero',
+      '  onboard [ids...]       give a hero to named wallets, or to all of them',
       '  import <key> [id]      import a base58 or JSON secret key',
       '  export <id>            print a wallet as solana-keygen JSON  (SECRET)',
       '  main [id]              show or set the main account',
@@ -232,7 +232,19 @@ async function main(): Promise<void> {
     }
 
     case 'onboard': {
-      const accounts = loadFleet(cfg.RELIC_KEYS_DIR);
+      // Naming wallets avoids logging into the whole fleet just to discover
+      // which ones already have a character. Auth is the scarcest resource
+      // here, and a full sweep spends most of it confirming nothing is wrong.
+      const named = argv.slice(1).filter((a) => !a.startsWith('--'));
+      const all = loadFleet(cfg.RELIC_KEYS_DIR);
+      const accounts =
+        named.length > 0 ? all.filter((a) => named.includes(a.id)) : all;
+
+      if (accounts.length === 0) {
+        console.log(`no wallets matched: ${named.join(', ')}`);
+        console.log(`known: ${all.map((a) => a.id).join(', ')}`);
+        break;
+      }
       console.log(`onboarding ${accounts.length} wallet(s), paced…\n`);
       const results = await onboardBatch(auth, accounts, { taken: new Set<string>() });
       for (const r of results) {
