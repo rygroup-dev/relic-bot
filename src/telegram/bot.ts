@@ -66,6 +66,14 @@ export class ControlBot {
   private pending = new Map<number, Pending>();
   /** Last suggested hero name per wallet+class, so a tap confirms what was shown. */
   private suggested = new Map<string, string>();
+  /**
+   * Wallet ids from the most recent mint, per chat.
+   *
+   * Bulk job assignment targets these rather than the whole fleet: logging into
+   * every wallet to discover it already has a character wastes the auth quota,
+   * which is the scarcest resource here.
+   */
+  private lastMinted = new Map<number, string[]>();
 
   constructor(
     private readonly opts: TelegramOptions,
@@ -224,9 +232,11 @@ export class ControlBot {
       : '';
 
     const kb = new InlineKeyboard()
+      .text('✨ Mint + job', 'wal:mintjob')
+      .row()
       .text('➕ 1', 'wal:mint:1')
       .text('➕ 5', 'wal:mint:5')
-      .text(`➕ ${MAX_BULK_MINT} (max)`, `wal:mint:${MAX_BULK_MINT}`)
+      .text(`➕ ${MAX_BULK_MINT}`, `wal:mint:${MAX_BULK_MINT}`)
       .row()
       .text('📥 Import key', 'wal:import')
       .row();
@@ -390,36 +400,68 @@ export class ControlBot {
   }
 
   /** Give every character-less wallet the same job, each with its own name. */
+  /**
+   * Onboard a named set of wallets, reporting progress as it goes.
+   *
+   * Shared by the plain "pick a job" path and the combined mint+job path so
+   * both behave identically.
+   */
+  private async onboardAccounts(
+    ctx: Context,
+    walletIds: readonly string[],
+    classId: ClassId | undefined,
+    minted?: readonly { id: string; address: string }[],
+  ): Promise<void> {
+    const wanted = new Set(walletIds);
+    const accounts = loadFleet(this.cfg.RELIC_KEYS_DIR).filter((a) => wanted.has(a.id));
+    if (accounts.length === 0) {
+      await this.show(ctx, '<b>🎭</b> No wallets to assign.', ControlBot.backRow());
+      return;
+    }
+
+    const rest = new RestClient(this.cfg.RELIC_BASE_URL);
+    const auth = new AuthClient(rest);
+    const prefix = minted ? ui.renderMinted(minted) + '\n\n' : '';
+
+    let last = 0;
+    const results = await onboardBatch(auth, accounts, {
+      ...(classId ? { classId } : {}),
+      taken: new Set<string>(),
+      onProgress: async (done, total) => {
+        if (Date.now() - last < 3000 && done !== total) return;
+        last = Date.now();
+        await this.show(
+          ctx,
+          `${prefix}<i>Creating heroes… ${done}/${total}</i>`,
+          new InlineKeyboard(),
+        ).catch(() => {});
+      },
+    });
+
+    await this.show(
+      ctx,
+      prefix + ui.renderOnboard(results),
+      ControlBot.backRow(
+        new InlineKeyboard()
+          .text('🎭 Characters', 'nav:chars')
+          .text('🔓 Clear parks', 'park:clear')
+          .row()
+          .text('🔑 Back up keys', 'wal:export'),
+      ),
+    );
+  }
+
   private async bulkOnboard(ctx: Context, classId: ClassId): Promise<void> {
     try {
-      const accounts = loadFleet(this.cfg.RELIC_KEYS_DIR);
-      const rest = new RestClient(this.cfg.RELIC_BASE_URL);
-      const auth = new AuthClient(rest);
-
-      let last = 0;
-      const results = await onboardBatch(auth, accounts, {
-        classId,
-        taken: new Set<string>(),
-        onProgress: async (done, total) => {
-          if (Date.now() - last < 3000 && done !== total) return;
-          last = Date.now();
-          await this.show(
-            ctx,
-            `<b>${CLASS_ICON[classId]} Creating ${ui.esc(classId)}s…</b>\n\n${done}/${total}`,
-            new InlineKeyboard(),
-          ).catch(() => {});
-        },
-      });
-
-      await this.show(
-        ctx,
-        ui.renderOnboard(results),
-        ControlBot.backRow(
-          new InlineKeyboard()
-            .text('🎭 Characters', 'nav:chars')
-            .text('🔓 Clear parks', 'park:clear'),
-        ),
-      );
+      // Prefer the wallets just minted; fall back to the whole fleet only when
+      // there is no recent mint to scope to. Logging into wallets that already
+      // have a character just to discover that wastes the scarce auth quota.
+      const scoped = this.lastMinted.get(ctx.chat!.id);
+      const ids =
+        scoped && scoped.length > 0
+          ? scoped
+          : loadFleet(this.cfg.RELIC_KEYS_DIR).map((a) => a.id);
+      await this.onboardAccounts(ctx, ids, classId);
     } catch (err) {
       await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
     }
@@ -613,6 +655,64 @@ export class ControlBot {
     });
 
     // ---- wallets ----------------------------------------------------------
+    // ---- mint + job in one action ----------------------------------------
+    this.bot.callbackQuery('wal:mintjob', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const kb = new InlineKeyboard();
+      for (const c of CLASSES) kb.text(`${CLASS_ICON[c]} ${c}`, `wal:mj:${c}`).row();
+      await this.show(
+        ctx,
+        [
+          '<b>✨ Mint wallets with a job</b>',
+          '',
+          'Pick the job first, then how many wallets.',
+          'Each one is created, given a hero, and ready to play.',
+          '',
+          '⚠️ Hero names are permanent; each gets its own generated name.',
+        ].join('\n'),
+        ControlBot.backRow(kb),
+      );
+    });
+
+    this.bot.callbackQuery(/^wal:mj:([a-z]+)$/, async (ctx) => {
+      const classId = ctx.match![1] as ClassId;
+      await ctx.answerCallbackQuery();
+      const kb = new InlineKeyboard()
+        .text('1', `wal:mjgo:${classId}:1`)
+        .text('3', `wal:mjgo:${classId}:3`)
+        .text('5', `wal:mjgo:${classId}:5`)
+        .text(`${MAX_BULK_MINT}`, `wal:mjgo:${classId}:${MAX_BULK_MINT}`)
+        .row();
+      await this.show(
+        ctx,
+        `<b>${CLASS_ICON[classId]} ${ui.esc(classId)}</b>\n\nHow many wallets?\n\n` +
+          `<i>Creation is paced — auth rate-limits, so a large batch takes a while.</i>`,
+        ControlBot.backRow(kb),
+      );
+    });
+
+    this.bot.callbackQuery(/^wal:mjgo:([a-z]+):(\d+)$/, async (ctx) => {
+      const classId = ctx.match![1] as ClassId;
+      const n = Number(ctx.match![2]);
+      await ctx.answerCallbackQuery({ text: `minting ${n}…` });
+      try {
+        const made =
+          n === 1
+            ? [createWallet(this.cfg.RELIC_KEYS_DIR)]
+            : createWallets(this.cfg.RELIC_KEYS_DIR, n);
+        this.lastMinted.set(ctx.chat!.id, made.map((w) => w.id));
+
+        await this.show(
+          ctx,
+          ui.renderMinted(made) + `\n\n<i>Creating ${ui.esc(classId)} heroes…</i>`,
+          new InlineKeyboard(),
+        );
+        await this.onboardAccounts(ctx, made.map((w) => w.id), classId, made);
+      } catch (err) {
+        await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
+      }
+    });
+
     this.bot.callbackQuery(/^wal:mint:(\d+)$/, async (ctx) => {
       const n = Number(ctx.match![1]);
       await ctx.answerCallbackQuery({ text: `minting ${n}…` });
@@ -620,6 +720,8 @@ export class ControlBot {
         const made = n === 1
           ? [createWallet(this.cfg.RELIC_KEYS_DIR)]
           : createWallets(this.cfg.RELIC_KEYS_DIR, n);
+
+        this.lastMinted.set(ctx.chat!.id, made.map((w) => w.id));
 
         const kb = new InlineKeyboard();
         if (made.length > 1) {
@@ -765,17 +867,20 @@ export class ControlBot {
 
     this.bot.callbackQuery('chr:bulkpick', async (ctx) => {
       await ctx.answerCallbackQuery();
+      const targets = this.lastMinted.get(ctx.chat!.id) ?? [];
+      const scope = targets.length > 0 ? `${targets.length} newly minted wallet` : 'every wallet';
+
       const kb = new InlineKeyboard();
       for (const c of CLASSES) kb.text(`${CLASS_ICON[c]} ${c}`, `chr:bulkgo:${c}`).row();
       await this.show(
         ctx,
         [
-          '<b>🎯 One job for every wallet without a character</b>',
+          `<b>🎯 One job for ${ui.esc(scope)}${targets.length > 1 ? 's' : ''}</b>`,
           '',
           'Each hero still gets its own generated name.',
           '',
           '⚠️ Names are permanent.',
-          '<i>🔒 classes will be refused on wallets that lack the RELIC —</i>',
+          '<i>🔒 classes are refused on wallets that lack the RELIC —</i>',
           '<i>those are reported individually, the rest still succeed.</i>',
         ].join('\n'),
         ControlBot.backRow(kb),
