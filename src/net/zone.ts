@@ -14,6 +14,26 @@ import { logger } from '../log.js';
 
 const log = logger('zone');
 
+/**
+ * Client version handshake.
+ *
+ * The server rejects a join with `client_outdated` (close code 4216) unless the
+ * room options carry the xp-curve version the deployed client was built with.
+ * Recovered from the bundle: `xpCurveVersion: gS`, where `gS` resolves through
+ * the modal chunk's `a1` export to the literal 5.
+ *
+ * Overridable via RELIC_XP_CURVE_VERSION so a server-side bump can be followed
+ * without a rebuild - a fleet-wide park plus one env change, not a redeploy.
+ */
+export const DEFAULT_XP_CURVE_VERSION = 5;
+
+export function xpCurveVersion(): number {
+  const raw = process.env.RELIC_XP_CURVE_VERSION;
+  if (!raw) return DEFAULT_XP_CURVE_VERSION;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : DEFAULT_XP_CURVE_VERSION;
+}
+
 export interface ZoneOptions {
   /** wss://playrelic.gg in production. */
   endpoint: string;
@@ -21,6 +41,11 @@ export interface ZoneOptions {
   token: string;
   name?: string;
   classId?: string;
+  level?: number;
+  col?: number;
+  row?: number;
+  getUpReadyAt?: number;
+  duelsDisabled?: boolean;
 }
 
 export type ServerMessageHandler = (type: string, payload: unknown) => void;
@@ -61,9 +86,19 @@ export class ZoneConnection {
     client.auth.token = this.opts.token;
 
     const roomName = this.opts.room ?? ROOM.TOWN;
-    const options: Record<string, unknown> = { token: this.opts.token };
+    // Mirror the production client's join options exactly. Omitting
+    // xpCurveVersion is what gets a join refused as `client_outdated`.
+    const options: Record<string, unknown> = {
+      token: this.opts.token,
+      xpCurveVersion: xpCurveVersion(),
+    };
     if (this.opts.name) options.name = this.opts.name;
     if (this.opts.classId) options.classId = this.opts.classId;
+    if (this.opts.level !== undefined) options.level = this.opts.level;
+    if (this.opts.col !== undefined) options.col = this.opts.col;
+    if (this.opts.row !== undefined) options.row = this.opts.row;
+    if (this.opts.getUpReadyAt !== undefined) options.getUpReadyAt = this.opts.getUpReadyAt;
+    if (this.opts.duelsDisabled !== undefined) options.duelsDisabled = this.opts.duelsDisabled;
 
     try {
       this.room = await client.joinOrCreate(roomName, options);

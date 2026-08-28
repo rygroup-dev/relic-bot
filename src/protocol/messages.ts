@@ -118,6 +118,7 @@ export const REFUSAL = {
   CLIENT_OUTDATED: 'client_outdated',
   DEVICE_BUSY: 'device_busy',
   RATE_LIMITED: 'rate_limited',
+  NO_CHARACTER: 'no_character',
 } as const;
 
 export type RefusalKind =
@@ -125,6 +126,7 @@ export type RefusalKind =
   | 'client_outdated'
   | 'device_busy'
   | 'rate_limited'
+  | 'no_character'
   | 'unknown';
 
 /** How the orchestrator must respond to a refusal. */
@@ -157,6 +159,12 @@ export function classifyRefusal(raw: unknown): RefusalVerdict {
   }
   if (/rate_limit/.test(s)) {
     return { kind: 'rate_limited', scope: 'account', cooldownMs: 60_000, needsOperator: false };
+  }
+  if (/no_character/.test(s)) {
+    // Retrying cannot conjure a character: the wallet has none, and creating
+    // one is a permanent, named choice that belongs to the operator. Park the
+    // account and say so, rather than reconnecting forever at zero errors.
+    return { kind: 'no_character', scope: 'account', cooldownMs: Infinity, needsOperator: true };
   }
   return { kind: 'unknown', scope: 'retry', cooldownMs: 15_000, needsOperator: false };
 }

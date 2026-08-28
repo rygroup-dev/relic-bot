@@ -31,6 +31,16 @@ describe('refusal classification (a benign-looking refusal must still block)', (
     expect(v.scope).toBe('account');
     expect(v.cooldownMs).toBeGreaterThan(0);
   });
+
+  it('parks indefinitely on no_character instead of reconnecting forever', () => {
+    // Observed live 2026-08-28: a wallet with no game character is refused at
+    // join. Retrying can never fix it, so it must stop and ask the operator.
+    const v = classifyRefusal('no_character');
+    expect(v.kind).toBe('no_character');
+    expect(v.scope).toBe('account');
+    expect(v.cooldownMs).toBe(Infinity);
+    expect(v.needsOperator).toBe(true);
+  });
 });
 
 describe('SLCW REGRESSION: free() is the only way to run value work', () => {

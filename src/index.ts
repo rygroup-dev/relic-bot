@@ -23,14 +23,19 @@ async function main(): Promise<void> {
   const fleet = new Fleet(cfg, process.env.SOLANA_RPC_URL);
 
   let control: ControlBot | null = null;
-  if (cfg.TELEGRAM_BOT_TOKEN && cfg.ownerIds.length > 0) {
+  // Only the token is required: with no owner id configured, the first person
+  // to message the bot claims it (see ControlBot.claimIfUnowned).
+  if (cfg.TELEGRAM_BOT_TOKEN) {
     control = new ControlBot(
       { token: cfg.TELEGRAM_BOT_TOKEN, ownerIds: cfg.ownerIds, cfg },
       fleet,
     );
     await control.start();
+    if (cfg.ownerIds.length === 0) {
+      log.warn('no TELEGRAM_OWNER_IDS set — the first chat to message the bot will claim it');
+    }
   } else {
-    log.warn('telegram disabled (TELEGRAM_BOT_TOKEN or TELEGRAM_OWNER_IDS unset)');
+    log.warn('telegram disabled (TELEGRAM_BOT_TOKEN unset)');
   }
 
   await fleet.start();

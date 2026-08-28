@@ -184,15 +184,21 @@ export function resolveMain(members: readonly FleetMember[], configured?: string
   return found;
 }
 
-/** Persist the main-account choice into .env so it survives a restart. */
-export function persistMainAccount(envPath: string, walletId: string): void {
+/** Write a single KEY=value into .env, replacing any existing line. */
+export function persistEnvValue(envPath: string, key: string, value: string): void {
   let text = existsSync(envPath) ? readFileSync(envPath, 'utf8') : '';
-  const line = `RELIC_MAIN_ACCOUNT=${walletId}`;
-  if (/^RELIC_MAIN_ACCOUNT=.*$/m.test(text)) {
-    text = text.replace(/^RELIC_MAIN_ACCOUNT=.*$/m, line);
+  const line = `${key}=${value}`;
+  const re = new RegExp(`^${key}=.*$`, 'm');
+  if (re.test(text)) {
+    text = text.replace(re, line);
   } else {
     text += `${text.endsWith('\n') || text === '' ? '' : '\n'}${line}\n`;
   }
   writeFileSync(envPath, text, { mode: 0o600 });
   chmodSync(envPath, 0o600);
+}
+
+/** Persist the main-account choice into .env so it survives a restart. */
+export function persistMainAccount(envPath: string, walletId: string): void {
+  persistEnvValue(envPath, 'RELIC_MAIN_ACCOUNT', walletId);
 }

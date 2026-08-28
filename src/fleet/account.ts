@@ -152,6 +152,10 @@ export class AccountRunner {
       token: this.session.token,
       ...(this.session.character?.name ? { name: this.session.character.name } : {}),
       ...(this.session.character?.classId ? { classId: this.session.character.classId } : {}),
+      ...(typeof this.session.character?.level === 'number'
+        ? { level: this.session.character.level }
+        : {}),
+      duelsDisabled: true,
     });
 
     zone.onState((s) => {

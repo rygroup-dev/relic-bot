@@ -25,6 +25,7 @@ import {
   fleetMembers,
   resolveMain,
   persistMainAccount,
+  persistEnvValue,
 } from '../wallet/manage.js';
 import { Treasury, type SweepReport, type FleetMember } from '../wallet/treasury.js';
 import { RELIC_MINT } from '../protocol/endpoints.js';
@@ -43,6 +44,7 @@ type Pending =
 
 export interface TelegramOptions {
   token: string;
+  /** Mutated in place when ownership is claimed on first contact. */
   ownerIds: number[];
   cfg: Config;
 }
@@ -67,11 +69,41 @@ export class ControlBot {
     return this.opts.cfg;
   }
 
+  /**
+   * First-contact ownership claim.
+   *
+   * A fresh install has no owner id, and an empty allowlist must mean nobody
+   * rather than everybody — otherwise the whole control surface would be open
+   * to any stranger who found the bot. So instead of opening up, the FIRST
+   * person to talk to the bot claims it permanently, and everyone after that
+   * is refused.
+   *
+   * The claim is written straight to .env so it survives a restart. To hand the
+   * bot to someone else, clear TELEGRAM_OWNER_IDS and restart.
+   */
+  private claimIfUnowned(ctx: Context): boolean {
+    if (this.opts.ownerIds.length > 0) return false;
+    const id = ctx.from?.id;
+    if (id === undefined) return false;
+
+    this.opts.ownerIds.push(id);
+    try {
+      persistEnvValue(join(process.cwd(), '.env'), 'TELEGRAM_OWNER_IDS', String(id));
+    } catch (e) {
+      log.warn(`could not persist the owner id: ${(e as Error).message}`);
+    }
+    log.info(
+      `ownership claimed by telegram user ${id} (${ctx.from?.username ?? 'no username'}) ` +
+        `— every other chat is now refused`,
+    );
+    return true;
+  }
+
   private isOwner(ctx: Context): boolean {
     const id = ctx.from?.id;
     if (id === undefined) return false;
-    // An empty allowlist must mean nobody, never everybody.
-    return this.opts.ownerIds.length > 0 && this.opts.ownerIds.includes(id);
+    if (this.opts.ownerIds.length === 0) return false;
+    return this.opts.ownerIds.includes(id);
   }
 
   private connection(): Connection {
@@ -278,7 +310,21 @@ export class ControlBot {
 
   private wire(): void {
     this.bot.use(async (ctx, next) => {
-      if (!this.isOwner(ctx)) return;
+      const claimed = this.claimIfUnowned(ctx);
+      if (!this.isOwner(ctx)) return; // silent drop for everyone else
+      if (claimed) {
+        await ctx.reply(
+          [
+            '<b>👋 Bot claimed</b>',
+            '',
+            `You are now the owner (id <code>${ctx.from!.id}</code>).`,
+            'Everyone else is ignored from here on.',
+            '',
+            '<i>Saved to .env, so this survives a restart.</i>',
+          ].join('\n'),
+          { parse_mode: 'HTML' },
+        );
+      }
       await next();
     });
 
