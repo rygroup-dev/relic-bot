@@ -55,6 +55,15 @@ export interface EntryOptions {
   atRow: number;
   startDepth?: number;
   timeoutMs?: number;
+  /**
+   * Attached the instant the dungeon room exists, before this function yields.
+   *
+   * The server pushes initial state — inventory, party, artifact and shiny
+   * state — the moment the seat reservation is consumed. Registering a handler
+   * after the join promise resolves loses all of it, and `s.inv.sync` is sent
+   * exactly once, so the bot would run the whole dungeon with an empty bag.
+   */
+  onMessage?: (type: string, payload: unknown) => void;
 }
 
 export class EntryDeniedError extends Error {
@@ -134,6 +143,14 @@ export async function enterSoloDungeon(opts: EntryOptions): Promise<DungeonEntry
 
     log.info('reservation received, joining dungeon');
     const room = await client.consumeSeatReservation(reservation as never);
+
+    // Attach before anything else awaits: initial state is already in flight.
+    if (opts.onMessage) {
+      room.onMessage('*', (type: unknown, payload: unknown) => {
+        opts.onMessage!(String(type), payload);
+      });
+    }
+
     log.info(`joined dungeon as session ${room.sessionId}`);
 
     // The lobby has done its job; holding it open wastes a connection.

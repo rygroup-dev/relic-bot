@@ -98,6 +98,37 @@ export class AccountRunner {
   private moveSeq = 0;
   /** Everything the s.* signal stream tells us — inventory, gold, cooldowns. */
   private signals = new SignalState();
+  /** Session id of the dungeon room, known only once the join completes. */
+  private dungeonSessionId: string | null = null;
+
+  /**
+   * Every message from the dungeon room.
+   *
+   * Attached at join time rather than after, because the server's opening
+   * burst of state arrives immediately and `s.inv.sync` is sent only once.
+   */
+  private onDungeonSignal(type: string, payload: unknown): void {
+    this.signals.apply(type, payload, this.dungeonSessionId);
+
+    if (SIGNAL_VALUE.includes(type)) {
+      this.d.ledger.append({
+        accountId: this.account.id,
+        kind: type === SIG.LOOT_GOLD ? 'gold' : 'loot',
+        detail: type,
+      });
+    }
+
+    if (type === SIG.DEATH) {
+      if (this.signals.dead) {
+        this.note = 'died in the dungeon';
+      } else {
+        // A death that is not ours is a kill — the only kill evidence there is.
+        for (const monster of this.signals.drainKills()) {
+          this.d.combat.record(this.account.id, monster, 'win');
+        }
+      }
+    }
+  }
 
   constructor(
     readonly account: Account,
@@ -274,6 +305,9 @@ export class AccountRunner {
 
     await free(this.d.parks, this.account.id, 'dungeon', async () => {
       let entry;
+      // Cleared before the join so the opening burst is never attributed to a
+      // previous run's session id.
+      this.dungeonSessionId = null;
       try {
         entry = await enterSoloDungeon({
           endpoint: zoneEndpoint(this.d.cfg.RELIC_BASE_URL),
@@ -281,6 +315,10 @@ export class AccountRunner {
           atCol,
           atRow,
           startDepth: 1,
+          // Registered inside the join so the server's initial state burst —
+          // s.inv.sync in particular, which is sent exactly once — is not lost
+          // in the gap between the join resolving and a handler being added.
+          onMessage: (type, payload) => this.onDungeonSignal(type, payload),
         });
       } catch (err) {
         if (err instanceof EntryDeniedError) {
@@ -297,32 +335,7 @@ export class AccountRunner {
       this.signals.resetRun();
       let finished = false;
 
-      // The s.* namespace carries inventory, gold, xp, cooldowns and deaths.
-      // Without it the bot fights blind and the ledger never sees a thing.
-      room.onMessage('*', (type: unknown, payload: unknown) => {
-        const t = String(type);
-        this.signals.apply(t, payload, room.sessionId);
-
-        if (SIGNAL_VALUE.includes(t)) {
-          this.d.ledger.append({
-            accountId: this.account.id,
-            kind: t === SIG.LOOT_GOLD ? 'gold' : 'loot',
-            detail: t,
-          });
-        }
-        if (t === SIG.DEATH) {
-          if (this.signals.dead) {
-            this.note = 'died in the dungeon';
-          } else {
-            // Record every mob death as a battle won. This is the second
-            // liveness detector: a rising battle count proves the bot is
-            // actually fighting, independently of the value ledger.
-            for (const monster of this.signals.drainKills()) {
-              this.d.combat.record(this.account.id, monster, 'win');
-            }
-          }
-        }
-      });
+      this.dungeonSessionId = room.sessionId;
 
       for (const type of VALUE_SIGNALS) {
         room.onMessage(type, (payload: unknown) => {
