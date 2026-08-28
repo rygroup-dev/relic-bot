@@ -202,20 +202,45 @@ than it looks:
 
 ## Economy model
 
-Marketplace fee, from `/docs`: **10% for USDC listings, 5% for RELIC listings**,
-seller-paid.
+**The docs and the shipped client disagree about the fee, and the client wins.**
 
-RELIC's lower fee is not free money — it is a volatile pump.fun asset against a
-stablecoin. So the pricing engine compares *risk-adjusted* net:
+`/docs` claims 10% for USDC and 5% for RELIC. The deployed client computes both
+at 1000 bps — 10% either way:
 
+```js
+const y8 = 1000n, S8 = 1000n;
+xy(c) = c === "relic" ? S8 : y8     // both 1000
+v8(c) = Number(xy(c)) / 1e4         // 0.10, displayed to the player as 10%
 ```
-net_usdc  = price × 0.90
-net_relic = price × 0.95 × (1 − RELIC_VOLATILITY_DISCOUNT_PCT)
+
+So RELIC carries **no fee advantage at all**. Trusting the published 5% would
+overstate RELIC proceeds on every sale. Since RELIC is a volatile pump.fun
+asset against a stablecoin, USDC is strictly better unless you actively want
+RELIC exposure.
+
+### The $1.00 floor is a rule, not a market
+
+A sample of 400 listings showed a $1.00 median across 237 legendaries. That is
+not what buyers decided — it is the minimum the game accepts:
+
+```js
+b8(c) = BigInt(c === "relic" ? 1e10 : 1e6)   // $1.00, or 10,000 RELIC
 ```
 
-At the conservative 8% default, USDC wins (0.900 vs 0.874). Below roughly 5.26%
-RELIC wins. That knob is yours: it encodes a judgement about risk appetite, so
-it is configuration, not a hidden constant.
+### Selling requires holding 10,000 RELIC
+
+Verified from the client's own copy, not inferred:
+
+> "Selling on the marketplace (and buying $Relic-priced listings) requires
+> holding 10,000 $Relic. Browsing and buying with USDC are free."
+
+> "The game is free to play. To continue playing, you need to hold 10,000 $Relic."
+
+This is **per wallet**, and it gates the bot's only revenue channel: a wallet
+below the threshold can farm, but cannot sell what it farms. The figure is
+recorded in the source as documentation and is deliberately never used as a
+runtime threshold — `/api/token-gate/status` returns only `{ allowed }`, and a
+hardcoded number would silently disagree with the server the day it changes.
 
 All money is handled as `bigint` micro-units. No monetary amount ever touches a
 float.

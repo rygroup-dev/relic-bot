@@ -1,16 +1,16 @@
 /**
  * Listing price and currency selection.
  *
- * Fee model, quoted verbatim from https://playrelic.gg/docs (Marketplace):
- *   "A seller-paid marketplace fee is deducted on settlement:
- *    10% for USDC listings or 5% for RELIC listings."
+ * Fee model, taken from the shipped client rather than the docs.
  *
- * RELIC therefore keeps 95% versus USDC's 90% — but RELIC is a volatile
- * pump.fun asset while USDC is a stablecoin, so the extra 5 points are not
- * free. We apply an explicit volatility discount to RELIC proceeds and pick
- * whichever currency maximises *risk-adjusted* net. The discount is a config
- * knob, not a hidden constant, because it encodes a judgement about risk
- * appetite that belongs to the operator.
+ * The docs claim 10% for USDC and 5% for RELIC. The deployed client computes
+ * both at 1000 bps — 10% either way (see MARKETPLACE_FEE_BPS). RELIC therefore
+ * carries NO fee advantage, and since it is a volatile pump.fun asset against
+ * a stablecoin, USDC is strictly better unless the operator actively wants
+ * RELIC exposure.
+ *
+ * The volatility discount is kept because it still expresses that preference,
+ * but it no longer has 5 percentage points of fee saving to overcome.
  *
  * All money is integer micro-units (1e-6). No floating point is ever used to
  * carry a monetary amount.

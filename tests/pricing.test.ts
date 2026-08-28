@@ -8,15 +8,21 @@ import {
 
 const ONE = 1_000_000n; // 1.000000 in micro-units
 
-describe('marketplace fee (docs: 10% USDC / 5% RELIC, seller-paid)', () => {
+describe('marketplace fee — the shipped client, not the docs', () => {
   it('deducts 10% for USDC listings', () => {
     expect(netAfterFee(ONE, 'usdc')).toBe(900_000n);
     expect(feeAmount(ONE, 'usdc')).toBe(100_000n);
   });
 
-  it('deducts 5% for RELIC listings', () => {
-    expect(netAfterFee(ONE, 'relic')).toBe(950_000n);
-    expect(feeAmount(ONE, 'relic')).toBe(50_000n);
+  it('deducts 10% for RELIC listings too, despite the docs claiming 5%', () => {
+    // The client computes both currencies at 1000 bps. Trusting the published
+    // 5% would overstate RELIC proceeds on every single sale.
+    expect(netAfterFee(ONE, 'relic')).toBe(900_000n);
+    expect(feeAmount(ONE, 'relic')).toBe(100_000n);
+  });
+
+  it('gives RELIC no fee advantage at all', () => {
+    expect(netAfterFee(ONE, 'relic')).toBe(netAfterFee(ONE, 'usdc'));
   });
 
   it('never returns more than the price, and never negative', () => {
@@ -36,36 +42,39 @@ describe('marketplace fee (docs: 10% USDC / 5% RELIC, seller-paid)', () => {
 });
 
 describe('currency choice is risk-adjusted, not naive', () => {
-  it('prefers USDC at the conservative 8% default despite the lower fee on RELIC', () => {
+  it('prefers USDC at the 8% default', () => {
     const c = chooseCurrency({
       priceMicroUsdc: ONE,
       relicVolatilityDiscountPct: 8,
       preference: 'auto',
     });
-    // RELIC: 0.95 * 0.92 = 0.874 < USDC 0.90
+    // RELIC: 0.90 * 0.92 = 0.828 < USDC 0.90
     expect(c.currency).toBe('usdc');
     expect(c.riskAdjustedNetMicroUsdc).toBe(900_000n);
   });
 
-  it('crosses over to RELIC once the discount falls below ~5.26%', () => {
-    const c = chooseCurrency({
-      priceMicroUsdc: ONE,
-      relicVolatilityDiscountPct: 5,
-      preference: 'auto',
-    });
-    // RELIC: 0.95 * 0.95 = 0.9025 > USDC 0.90
-    expect(c.currency).toBe('relic');
-    expect(c.riskAdjustedNetMicroUsdc).toBe(902_500n);
+  it('never crosses over to RELIC while any volatility is assumed', () => {
+    // With equal fees there is nothing for RELIC to win on, so any discount
+    // above zero makes USDC the better risk-adjusted choice.
+    for (const pct of [1, 5, 8, 20]) {
+      const c = chooseCurrency({
+        priceMicroUsdc: ONE,
+        relicVolatilityDiscountPct: pct,
+        preference: 'auto',
+      });
+      expect(c.currency, `at ${pct}%`).toBe('usdc');
+    }
   });
 
-  it('treats RELIC as strictly better when the operator assumes no volatility', () => {
+  it('only ties with RELIC when the operator assumes no volatility at all', () => {
     const c = chooseCurrency({
       priceMicroUsdc: ONE,
       relicVolatilityDiscountPct: 0,
       preference: 'auto',
     });
-    expect(c.currency).toBe('relic');
-    expect(c.riskAdjustedNetMicroUsdc).toBe(950_000n);
+    // Equal net; the comparison is strict, so USDC keeps it.
+    expect(c.riskAdjustedNetMicroUsdc).toBe(900_000n);
+    expect(c.currency).toBe('usdc');
   });
 
   it('honours an explicit operator override', () => {
@@ -122,5 +131,43 @@ describe('price suggestion', () => {
 
   it('declines on a zero-priced comparable rather than listing for free', () => {
     expect(suggestPrice([{ priceMicroUsdc: 0n, currency: 'usdc' }], base)).toBeNull();
+  });
+});
+
+describe('the gate and the listing floor are recorded, not guessed', () => {
+  it('records the 10,000 RELIC hold as documentation only', async () => {
+    const { DOCUMENTED_GATE_HOLD_RELIC } = await import('../src/protocol/endpoints.js');
+    expect(DOCUMENTED_GATE_HOLD_RELIC).toBe(10_000);
+  });
+
+  it('never uses that figure as a runtime threshold', async () => {
+    // The gate endpoint returns only { allowed }. Comparing a local balance
+    // against a hardcoded number would silently disagree with the server the
+    // day it changes, so nothing may branch on this constant.
+    const { execSync } = await import('node:child_process');
+    const src = new URL('../src', import.meta.url).pathname;
+    const uses = execSync(`grep -rln 'DOCUMENTED_GATE_HOLD_RELIC' ${src} || true`, {
+      encoding: 'utf8',
+    })
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((p) => p.replace(/^.*\/src\//, 'src/'));
+    expect(uses).toEqual(['src/protocol/endpoints.ts']);
+  });
+
+  it('knows the minimum a listing may be priced at', async () => {
+    const { MIN_LISTING_PRICE } = await import('../src/protocol/endpoints.js');
+    // $1.00, and 10,000 RELIC at 6 decimals.
+    expect(MIN_LISTING_PRICE.usdc).toBe(1_000_000n);
+    expect(MIN_LISTING_PRICE.relic).toBe(10_000_000_000n);
+  });
+
+  it('explains the $1.00 floor seen across 237 legendary listings', async () => {
+    const { MIN_LISTING_PRICE } = await import('../src/protocol/endpoints.js');
+    const { expectedValueMicroUsdc } = await import('../src/economy/valuation.js');
+    // The observed legendary "median" is exactly the minimum the game allows,
+    // so it reflects the floor rather than what buyers were willing to pay.
+    expect(expectedValueMicroUsdc('legendary')).toBe(MIN_LISTING_PRICE.usdc);
   });
 });
