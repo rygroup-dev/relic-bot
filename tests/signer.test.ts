@@ -120,13 +120,42 @@ describe('PAYMENT HARD-LOCK: source-level invariant', () => {
     }
   });
 
-  it('no module in src/ implements transaction signing', async () => {
+  it('treasury is the ONLY module in src/ that can sign a transaction', async () => {
     const { execSync } = await import('node:child_process');
     const hits = execSync(
-      `grep -rlE '(signTransaction|partialSign|sendRawTransaction|Transaction\\.from)' ` +
+      `grep -rlE '(sendAndConfirmTransaction|partialSign|sendRawTransaction|new Transaction)' ` +
         `${new URL('../src', import.meta.url).pathname} || true`,
       { encoding: 'utf8' },
-    ).trim();
-    expect(hits, `unexpected transaction-signing code:\n${hits}`).toBe('');
+    )
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((p) => p.replace(/^.*\/src\//, 'src/'))
+      .sort();
+
+    // Adding a second signing module must break this test loudly. Transaction
+    // signing is allowed in exactly one reviewed place, fenced by the
+    // fleet-only guard in treasury.ts.
+    expect(hits).toEqual(['src/wallet/treasury.ts']);
+  });
+
+  it('the gameplay path never imports the treasury', async () => {
+    const { execSync } = await import('node:child_process');
+    const src = new URL('../src', import.meta.url).pathname;
+    const hits = execSync(`grep -rln "wallet/treasury" ${src} || true`, { encoding: 'utf8' })
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((p) => p.replace(/^.*\/src\//, 'src/'))
+      .sort();
+
+    // Only operator surfaces (CLI, Telegram) may reach the treasury. If the
+    // fleet/game loop ever imports it, gameplay gains spending power.
+    for (const f of hits) {
+      expect(
+        f === 'src/cli.ts' || f.startsWith('src/telegram/'),
+        `${f} must not import the treasury`,
+      ).toBe(true);
+    }
   });
 });

@@ -10,26 +10,35 @@ TypeScript · Node ≥ 22 · Colyseus `0.16.22` (pinned to the live client) · S
 
 ## The one thing to understand first
 
-> **This bot can sell. It cannot buy.**
+There are two separate signing surfaces, and the split is the whole design.
 
-Gameplay travels over a WebSocket and needs no signature. Selling on the
-marketplace is REST + Bearer and needs no signature. Only *buying* requires
-signing a Solana transaction — and **that code does not exist in this
-repository**.
+**The game path cannot sign a transaction at all.** Gameplay travels over a
+WebSocket and needs no signature; selling on the marketplace is REST + Bearer
+and needs no signature. `src/wallet/signer.ts` exports exactly one capability —
+signing the game's four-line UTF-8 login message. It cannot buy anything, and
+buying is not implemented anywhere.
 
-`src/wallet/signer.ts` exports exactly one capability: signing the game's
-four-line UTF-8 login message. There is no `signTransaction`, no
-`sendRawTransaction`, no `Transaction` import. This is enforced by tests that
-scan the entire `src/` tree, so it cannot be reintroduced by accident.
+**The treasury can sign, but only within your own fleet.** Consolidating
+proceeds needs real transfers, so `src/wallet/treasury.ts` can build and sign
+them — fenced by one invariant checked on every single transfer:
 
-The consequence is worth stating plainly: **an attacker with full control of
-this process still cannot move your funds**, because there is no code to do it.
-That is a stronger guarantee than a spend cap or an env flag, both of which are
-just data an attacker could change.
+> **Funds may only move between wallets you control.**
+>
+> - sweep: any fleet wallet → the main account (any asset)
+> - fund: the main account → any fleet wallet (SOL only, amount-capped)
+>
+> Any destination outside the loaded fleet is refused before a transaction is
+> even built.
 
-If buying is ever genuinely needed, it belongs in a separate, explicitly
-reviewed `src/wallet/spender.ts`. The architecture leaves a clean seam for it;
-nothing else has to change.
+So a compromised process cannot send your money to an attacker. The worst it
+can do is shuffle funds between your own wallets. That is weaker than "cannot
+sign at all" — the trade was made deliberately to get sweeps — but it is not
+weaker than any ordinary hot wallet.
+
+Both properties are enforced by tests, not comments: one test asserts that
+`treasury.ts` is the *only* module in `src/` capable of signing, another that
+the gameplay loop never imports it, and sixteen more cover the transfer guard
+itself.
 
 ---
 
@@ -180,20 +189,42 @@ regression tests.
 ## Commands
 
 ```
-npm run ctl -- wallets    accounts and addresses
-npm run ctl -- balance    on-chain RELIC per wallet (Token-2022)
-npm run ctl -- login      authenticate every wallet
-npm run ctl -- gate       token gate per wallet
-npm run ctl -- listings   current marketplace listings
-npm run ctl -- ledger     produced value per wallet
-npm run ctl -- doctor     full preflight
+# game
+npm run ctl -- doctor                 full preflight
+npm run ctl -- wallets                accounts and addresses
+npm run ctl -- login                  authenticate every wallet
+npm run ctl -- gate                   token gate per wallet
+npm run ctl -- listings               current marketplace listings
+npm run ctl -- ledger                 produced value per wallet
+
+# wallet management
+npm run ctl -- new [id]               generate a wallet
+npm run ctl -- import <key> [id]      import a base58 or JSON key
+npm run ctl -- export <id>            print as solana-keygen JSON (SECRET)
+npm run ctl -- main [id]              show or set the main account
+
+# treasury — dry run by default
+npm run ctl -- balance                on-chain RELIC per wallet
+npm run ctl -- holdings               every token balance per wallet
+npm run ctl -- sweep [--execute]      collect tokens into main
+npm run ctl -- fund  [--execute]      top up wallets low on gas
 ```
 
-There is deliberately no `buy` command.
+There is deliberately no `buy` command, and no command that can send to an
+address outside your fleet.
 
-Telegram: `/status` `/parks` `/unpark` `/gate` `/otak` `/health`. The bot
-ignores every chat not in `TELEGRAM_OWNER_IDS`; an empty allowlist means
-nobody, not everybody.
+### Telegram
+
+Send `/menu` for a button interface: fleet status, holdings, wallets, token
+gate, Otak, parks, sweep and gas funding. Anything that moves funds runs as a
+dry run first and needs a second confirmation tap before it broadcasts.
+
+Wallets can be created, imported, and exported (as `solana-keygen` JSON) from
+chat. An exported key self-deletes after 90 seconds, and every inbound secret —
+an imported key, an API key — is deleted the moment it arrives.
+
+The bot ignores every chat not in `TELEGRAM_OWNER_IDS`; an empty allowlist
+means nobody, not everybody.
 
 ---
 
@@ -201,14 +232,15 @@ nobody, not everybody.
 
 ```bash
 npm install
-npm test          # 90 tests
+npm test          # 107 tests
 npm run typecheck
 npm run build
 ```
 
-Test suites worth reading first: `tests/signer.test.ts` (the payment lock,
-including source-level scans of `src/`), `tests/safety.test.ts` (the park and
-liveness regressions), `tests/pricing.test.ts` (the fee model).
+Test suites worth reading first: `tests/signer.test.ts` (the game-path signing
+lock, including source-level scans of `src/`), `tests/treasury.test.ts` (the
+fleet-only transfer guard), `tests/safety.test.ts` (the park and liveness
+regressions), `tests/pricing.test.ts` (the fee model).
 
 Protocol reference: [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — 68 client messages,
 37 REST endpoints, the auth handshake, and the on-chain token facts.
@@ -237,6 +269,8 @@ before trusting `SELL_ENABLED` in production.
 - Every log line passes through a redactor (JWTs, `sk-` keys, Telegram tokens,
   base58 secrets, 64-int arrays)
 - Otak prompts carry sanitised game state only: no keys, no JWTs, no addresses
-- `RestClient` refuses every spend endpoint as a second lock behind the absent
-  signing code
+- `RestClient` refuses every in-game spend endpoint as a second lock behind the
+  absent buying code
+- The treasury refuses any destination outside the loaded fleet, before a
+  transaction is built
 - Nothing secret is ever committed: `.env`, `keys/`, `data/` are gitignored

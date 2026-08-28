@@ -56,9 +56,19 @@ export async function readRelicBalance(
     return acct.amount;
   } catch (err) {
     // No ATA yet simply means a zero balance; anything else is a read failure.
-    const msg = (err as Error).message ?? '';
-    if (/could not find account|TokenAccountNotFound/i.test(msg)) return 0n;
-    log.debug(`RELIC balance read failed for ${owner.slice(0, 8)}…: ${msg}`);
+    // NOTE: TokenAccountNotFoundError carries an EMPTY message, so the name
+    // must be checked as well — matching on the message alone silently turned
+    // every zero balance into "unknown" (caught by live test 2026-08-28).
+    const e = err as Error;
+    const name = e?.name ?? '';
+    const msg = e?.message ?? '';
+    if (
+      /TokenAccountNotFound|TokenInvalidAccountOwner/i.test(name) ||
+      /could not find account|TokenAccountNotFound/i.test(msg)
+    ) {
+      return 0n;
+    }
+    log.debug(`RELIC balance read failed for ${owner.slice(0, 8)}…: ${name} ${msg}`);
     return null;
   }
 }

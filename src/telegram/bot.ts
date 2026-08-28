@@ -1,247 +1,602 @@
 /**
  * Telegram control surface.
  *
- * Locked to an owner allowlist: every other chat is ignored silently. The bot
- * never prints a private key, a JWT, or an API key — `redact()` in log.ts is
- * applied to anything echoed back.
+ * Locked to an owner allowlist: every other chat is dropped silently. Nothing
+ * secret is ever echoed except an explicit, confirmed private-key export, which
+ * is auto-deleted from the chat afterwards.
+ *
+ * Anything that moves funds runs dry-first and requires a second confirmation
+ * tap before it broadcasts.
  */
 
-import { Bot, type Context } from 'grammy';
+import { Bot, InlineKeyboard, type Context } from 'grammy';
+import { Connection, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { join } from 'node:path';
 import type { Fleet } from '../fleet/orchestrator.js';
+import type { Config } from '../config.js';
 import { OtakKeyStore, type ProviderName } from '../otak/keys.js';
 import { OpenAIProvider } from '../otak/providers/openai.js';
 import { AnthropicProvider } from '../otak/providers/anthropic.js';
 import { FuguProvider } from '../otak/providers/fugu.js';
-import { formatRelic } from '../economy/gate.js';
+import {
+  createWallet,
+  importWallet,
+  exportWalletJson,
+  fleetMembers,
+  resolveMain,
+  persistMainAccount,
+} from '../wallet/manage.js';
+import { Treasury, type SweepReport, type FleetMember } from '../wallet/treasury.js';
+import { RELIC_MINT } from '../protocol/endpoints.js';
+import * as ui from './ui.js';
 import { redact, logger } from '../log.js';
 
 const log = logger('telegram');
-
 const PROVIDERS: ProviderName[] = ['openai', 'anthropic', 'fugu'];
+
+/** Seconds an exported private key stays visible in the chat. */
+const EXPORT_TTL_S = 90;
+
+type Pending =
+  | { kind: 'otak-key'; provider: ProviderName }
+  | { kind: 'import-wallet' };
 
 export interface TelegramOptions {
   token: string;
   ownerIds: number[];
-  dataDir: string;
+  cfg: Config;
 }
 
 export class ControlBot {
   private bot: Bot;
   private keys: OtakKeyStore;
-  /** Chats currently expected to send an API key as their next message. */
-  private awaitingKey = new Map<number, ProviderName>();
+  private pending = new Map<number, Pending>();
 
   constructor(
     private readonly opts: TelegramOptions,
     private readonly fleet: Fleet,
   ) {
     this.bot = new Bot(opts.token);
-    this.keys = new OtakKeyStore(opts.dataDir);
+    this.keys = new OtakKeyStore(opts.cfg.RELIC_DATA_DIR);
     this.wire();
+  }
+
+  // ---------------------------------------------------------------- infra --
+
+  private get cfg(): Config {
+    return this.opts.cfg;
   }
 
   private isOwner(ctx: Context): boolean {
     const id = ctx.from?.id;
     if (id === undefined) return false;
-    // An empty allowlist would otherwise mean "everyone"; refuse instead.
-    if (this.opts.ownerIds.length === 0) return false;
-    return this.opts.ownerIds.includes(id);
+    // An empty allowlist must mean nobody, never everybody.
+    return this.opts.ownerIds.length > 0 && this.opts.ownerIds.includes(id);
   }
+
+  private connection(): Connection {
+    return new Connection(
+      process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solana.com',
+      'confirmed',
+    );
+  }
+
+  private treasury(): Treasury {
+    const members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
+    const main = resolveMain(members, this.cfg.RELIC_MAIN_ACCOUNT);
+    return new Treasury({
+      connection: this.connection(),
+      fleet: members,
+      mainAddress: main.address,
+      maxFundLamports: BigInt(Math.round(this.cfg.GAS_MAX_SOL * LAMPORTS_PER_SOL)),
+    });
+  }
+
+  private static menu(): InlineKeyboard {
+    return new InlineKeyboard()
+      .text('⚔️ Fleet', 'nav:status')
+      .text('💰 Holdings', 'nav:holdings')
+      .row()
+      .text('👛 Wallets', 'nav:wallets')
+      .text('🔒 Gate', 'nav:gate')
+      .row()
+      .text('🧠 Otak', 'nav:otak')
+      .text('🅿️ Parks', 'nav:parks')
+      .row()
+      .text('🧹 Sweep', 'tre:sweep:dry')
+      .text('⛽ Fund gas', 'tre:fund:dry');
+  }
+
+  private static backRow(kb = new InlineKeyboard()): InlineKeyboard {
+    return kb.row().text('‹ Menu', 'nav:menu');
+  }
+
+  /** Reply to a tap by editing in place where possible, else sending fresh. */
+  private async show(
+    ctx: Context,
+    text: string,
+    kb: InlineKeyboard = ControlBot.backRow(),
+  ): Promise<void> {
+    const payload = { parse_mode: 'HTML' as const, reply_markup: kb };
+    if (ctx.callbackQuery) {
+      try {
+        await ctx.editMessageText(text, payload);
+        return;
+      } catch {
+        // Editing fails when the content is identical or too old; fall through.
+      }
+    }
+    await ctx.reply(text, payload);
+  }
+
+  // ---------------------------------------------------------------- views --
+
+  private async viewStatus(ctx: Context): Promise<void> {
+    await this.show(
+      ctx,
+      ui.renderStatus(this.fleet.status()),
+      ControlBot.backRow(new InlineKeyboard().text('🔄 Refresh', 'nav:status')),
+    );
+  }
+
+  private async viewParks(ctx: Context): Promise<void> {
+    const active = this.fleet.parks.active();
+    const kb = new InlineKeyboard();
+    if (active.length > 0) kb.text('🔓 Clear all parks', 'park:clear').row();
+    await this.show(ctx, ui.renderParks(active), ControlBot.backRow(kb));
+  }
+
+  private async viewGate(ctx: Context): Promise<void> {
+    const rows = this.fleet.status().map((r) => ({
+      id: r.id,
+      address: r.address,
+      allowed: r.gate ? r.gate.allowed : null,
+      relicBaseUnits: r.gate ? r.gate.relicBaseUnits : null,
+    }));
+    await this.show(
+      ctx,
+      ui.renderGate(rows),
+      ControlBot.backRow(new InlineKeyboard().text('🔄 Refresh', 'nav:gate')),
+    );
+  }
+
+  private async viewWallets(ctx: Context): Promise<void> {
+    let members: FleetMember[];
+    try {
+      members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
+    } catch {
+      // No keys yet is a normal first-run state, not an error to surface.
+      members = [];
+    }
+    const mainAddr = members.length
+      ? resolveMain(members, this.cfg.RELIC_MAIN_ACCOUNT).address
+      : '';
+
+    const kb = new InlineKeyboard()
+      .text('➕ New wallet', 'wal:new')
+      .text('📥 Import', 'wal:import')
+      .row();
+    if (members.length > 0) {
+      kb.text('⭐ Set main', 'wal:main').text('🔑 Export key', 'wal:export').row();
+    }
+
+    await this.show(
+      ctx,
+      ui.renderWallets(
+        members.map((m) => ({ id: m.id, address: m.address, isMain: m.address === mainAddr })),
+      ),
+      ControlBot.backRow(kb),
+    );
+  }
+
+  private async viewHoldings(ctx: Context): Promise<void> {
+    await this.show(ctx, '<i>Reading balances from chain…</i>', new InlineKeyboard());
+    try {
+      const t = this.treasury();
+      const rows = [];
+      for (const m of fleetMembers(this.cfg.RELIC_KEYS_DIR)) {
+        const sol = await t.solBalance(m.address);
+        const tokens = (await t.tokenHoldings(m.address)).map((h) => ({
+          mint: h.mint,
+          amount: h.amount,
+          decimals: h.decimals,
+          ...(h.mint === RELIC_MINT ? { label: 'RELIC' } : {}),
+        }));
+        rows.push({ id: m.id, address: m.address, isMain: m.address === t.main.address, sol, tokens });
+      }
+      await this.show(
+        ctx,
+        ui.renderHoldings(rows),
+        ControlBot.backRow(
+          new InlineKeyboard().text('🔄 Refresh', 'nav:holdings').text('🧹 Sweep', 'tre:sweep:dry'),
+        ),
+      );
+    } catch (err) {
+      await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
+    }
+  }
+
+  private async viewOtak(ctx: Context): Promise<void> {
+    const kb = new InlineKeyboard()
+      .text(this.fleet.otak.enabled ? '⚫ Turn OFF' : '🟢 Turn ON', 'otak:toggle')
+      .text('🩺 Health', 'otak:health')
+      .row()
+      .text('🔑 OpenAI', 'otak:key:openai')
+      .text('🔑 Anthropic', 'otak:key:anthropic')
+      .row()
+      .text('🔑 Fugu', 'otak:key:fugu');
+
+    await this.show(
+      ctx,
+      ui.renderOtak({
+        enabled: this.fleet.otak.enabled,
+        configured: this.keys.configured(),
+        health: this.fleet.otak.healthSnapshot(),
+        preferred: this.cfg.OTAK_PROVIDER,
+      }),
+      ControlBot.backRow(kb),
+    );
+  }
+
+  // ------------------------------------------------------------- treasury --
+
+  private async runTreasury(ctx: Context, op: 'sweep' | 'fund', execute: boolean): Promise<void> {
+    await this.show(
+      ctx,
+      execute ? '<i>Broadcasting…</i>' : '<i>Simulating…</i>',
+      new InlineKeyboard(),
+    );
+    try {
+      const t = this.treasury();
+      let report: SweepReport;
+      let title: string;
+
+      if (op === 'sweep') {
+        report = await t.sweepAll({
+          dryRun: !execute,
+          includeSol: this.cfg.SWEEP_INCLUDE_SOL,
+        });
+        title = `Collecting into <b>${ui.esc(t.main.id)}</b>\n\n`;
+      } else {
+        const min = BigInt(Math.round(this.cfg.GAS_MIN_SOL * LAMPORTS_PER_SOL));
+        const top = BigInt(Math.round(this.cfg.GAS_TOPUP_SOL * LAMPORTS_PER_SOL));
+        report = await t.fundGas(min, top, { dryRun: !execute });
+        title = `Topping up from <b>${ui.esc(t.main.id)}</b>\n\n`;
+      }
+
+      const kb = new InlineKeyboard();
+      if (!execute && report.transfers.length > 0) {
+        kb.text('✅ Confirm and send', `tre:${op}:go`).row();
+      }
+      await this.show(ctx, title + ui.renderSweepReport(report, !execute), ControlBot.backRow(kb));
+    } catch (err) {
+      await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
+    }
+  }
+
+  // -------------------------------------------------------------- wiring --
 
   private wire(): void {
     this.bot.use(async (ctx, next) => {
-      if (!this.isOwner(ctx)) return; // silent drop
+      if (!this.isOwner(ctx)) return;
       await next();
     });
 
-    this.bot.command('start', (ctx) =>
-      ctx.reply(
-        [
-          'relic-bot control',
-          '',
-          '/status  — fleet status',
-          '/parks   — active parks',
-          '/unpark  — clear all parks',
-          '/gate    — token-gate + RELIC balance per wallet',
-          '/otak    — LLM brain: providers, keys, on/off',
-          '/health  — probe every configured provider',
-          '',
-          'Payments are hard-locked: this bot can sell but never buy.',
-        ].join('\n'),
-      ),
-    );
+    const menu = async (ctx: Context): Promise<void> => {
+      await this.show(ctx, ui.HELP, ControlBot.menu());
+    };
 
-    this.bot.command('status', async (ctx) => {
-      const rows = this.fleet.status();
-      if (rows.length === 0) return ctx.reply('no accounts running');
-      const lines = rows.map((r) => {
-        const age =
-          r.lastValueAt === 0
-            ? 'never'
-            : `${Math.round((Date.now() - r.lastValueAt) / 60_000)}m ago`;
-        return (
-          `${r.id} [${r.phase}] gate=${r.gate ? (r.gate.allowed ? 'open' : 'CLOSED') : '?'} ` +
-          `battles=${r.battles} listed=${r.listings} lastValue=${age}\n  ${r.note}`
-        );
-      });
-      return ctx.reply(redact(lines.join('\n')));
+    this.bot.command(['start', 'help', 'menu'], menu);
+    this.bot.command('status', (ctx) => this.viewStatus(ctx));
+    this.bot.command('parks', (ctx) => this.viewParks(ctx));
+    this.bot.command('gate', (ctx) => this.viewGate(ctx));
+    this.bot.command('wallets', (ctx) => this.viewWallets(ctx));
+    this.bot.command('holdings', (ctx) => this.viewHoldings(ctx));
+    this.bot.command('otak', (ctx) => this.viewOtak(ctx));
+    this.bot.command('sweep', (ctx) => this.runTreasury(ctx, 'sweep', false));
+    this.bot.command('fund', (ctx) => this.runTreasury(ctx, 'fund', false));
+
+    // ---- navigation -------------------------------------------------------
+    this.bot.callbackQuery(/^nav:(.+)$/, async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const where = ctx.match![1];
+      if (where === 'menu') return menu(ctx);
+      if (where === 'status') return this.viewStatus(ctx);
+      if (where === 'parks') return this.viewParks(ctx);
+      if (where === 'gate') return this.viewGate(ctx);
+      if (where === 'wallets') return this.viewWallets(ctx);
+      if (where === 'holdings') return this.viewHoldings(ctx);
+      if (where === 'otak') return this.viewOtak(ctx);
     });
 
-    this.bot.command('parks', (ctx) => {
-      const active = this.fleet.parks.active();
-      if (active.length === 0) return ctx.reply('no active parks');
-      return ctx.reply(
-        redact(
-          active
-            .map(
-              (p) =>
-                `${p.scope}${p.accountId ? `/${p.accountId}` : ''} "${p.key}": ${p.reason}` +
-                (Number.isFinite(p.until)
-                  ? ` (${Math.max(0, Math.round((p.until - Date.now()) / 1000))}s left)`
-                  : ' (indefinite)'),
-            )
-            .join('\n'),
-        ),
-      );
-    });
-
-    this.bot.command('unpark', (ctx) => {
+    this.bot.callbackQuery('park:clear', async (ctx) => {
       const n = this.fleet.parks.unparkAll();
-      return ctx.reply(`cleared ${n} park entr${n === 1 ? 'y' : 'ies'}`);
+      await ctx.answerCallbackQuery({ text: `cleared ${n}` });
+      return this.viewParks(ctx);
     });
 
-    this.bot.command('gate', (ctx) => {
-      const rows = this.fleet.status();
-      if (rows.length === 0) return ctx.reply('no accounts running');
-      return ctx.reply(
-        rows
-          .map((r) => {
-            const g = r.gate;
-            const bal =
-              g?.relicBaseUnits === null || g?.relicBaseUnits === undefined
-                ? 'unknown'
-                : `${formatRelic(g.relicBaseUnits)} RELIC`;
-            return `${r.id}: gate=${g ? (g.allowed ? 'OPEN' : 'CLOSED') : 'unchecked'} balance=${bal}`;
-          })
-          .join('\n') +
-          '\n\nNote: the gate threshold is server-side and is not published; ' +
-          'this reports what the server actually answered.',
-      );
+    // ---- treasury ---------------------------------------------------------
+    this.bot.callbackQuery(/^tre:(sweep|fund):(dry|go)$/, async (ctx) => {
+      const op = ctx.match![1] as 'sweep' | 'fund';
+      const mode = ctx.match![2];
+      await ctx.answerCallbackQuery();
+      return this.runTreasury(ctx, op, mode === 'go');
     });
 
-    this.bot.command('otak', async (ctx) => {
-      const arg = (ctx.match ?? '').toString().trim();
-      const configured = this.keys.configured();
-
-      if (arg === 'on' || arg === 'off') {
-        this.rebuildProviders();
-        this.fleet.otak.setEnabled(arg === 'on');
-        return ctx.reply(`otak ${arg}${arg === 'on' && configured.length === 0 ? ' (no keys set — heuristics only)' : ''}`);
-      }
-
-      if (arg.startsWith('key ')) {
-        const p = arg.slice(4).trim() as ProviderName;
-        if (!PROVIDERS.includes(p)) return ctx.reply(`unknown provider: ${p}`);
-        this.awaitingKey.set(ctx.chat.id, p);
-        return ctx.reply(
-          `Send the ${p} API key as your next message.\n` +
-            `I will delete your message immediately and store the key encrypted.`,
+    // ---- wallets ----------------------------------------------------------
+    this.bot.callbackQuery('wal:new', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      try {
+        const w = createWallet(this.cfg.RELIC_KEYS_DIR);
+        await this.show(
+          ctx,
+          [
+            '<b>✅ Wallet created</b>',
+            '',
+            `id: <b>${ui.esc(w.id)}</b>`,
+            `address: ${ui.code(w.address)}`,
+            '',
+            'The key is stored at <code>0600</code> on this server.',
+            '<b>Back it up</b> — export it below and keep it somewhere safe.',
+            'If the server is lost and you have no backup, the wallet is gone.',
+          ].join('\n'),
+          ControlBot.backRow(new InlineKeyboard().text('👛 Wallets', 'nav:wallets')),
         );
+      } catch (err) {
+        await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
       }
+    });
 
-      if (arg.startsWith('clear ')) {
-        const p = arg.slice(6).trim() as ProviderName;
-        if (!PROVIDERS.includes(p)) return ctx.reply(`unknown provider: ${p}`);
-        this.keys.clear(p);
-        this.rebuildProviders();
-        return ctx.reply(`cleared ${p} key`);
-      }
-
-      return ctx.reply(
+    this.bot.callbackQuery('wal:import', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      this.pending.set(ctx.chat!.id, { kind: 'import-wallet' });
+      await this.show(
+        ctx,
         [
-          `otak: ${this.fleet.otak.enabled ? 'ON' : 'OFF'}`,
-          `keys set: ${configured.length ? configured.join(', ') : '(none)'}`,
+          '<b>📥 Import a wallet</b>',
           '',
-          'With no key, the bot still plays fully on deterministic heuristics.',
-          'With a key, the brain re-ranks the same candidates — it can never',
-          'invent an action, and it can never unlock a payment.',
+          'Send the secret key as your next message.',
           '',
-          '/otak on | off',
-          '/otak key openai | anthropic | fugu',
-          '/otak clear <provider>',
-          '/health',
+          'Accepted formats:',
+          '• base58 string (Phantom → Export Private Key)',
+          '• JSON array of 64 numbers (solana-keygen)',
+          '',
+          '<i>Your message is deleted the moment it arrives.</i>',
         ].join('\n'),
+        ControlBot.backRow(),
       );
     });
 
-    this.bot.command('health', async (ctx) => {
+    this.bot.callbackQuery('wal:main', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
+      const kb = new InlineKeyboard();
+      for (const m of members) kb.text(m.id, `wal:setmain:${m.id}`).row();
+      await this.show(
+        ctx,
+        '<b>⭐ Choose the main account</b>\n\nSweeps collect into this wallet, and gas is funded from it.',
+        ControlBot.backRow(kb),
+      );
+    });
+
+    this.bot.callbackQuery(/^wal:setmain:(.+)$/, async (ctx) => {
+      const id = ctx.match![1]!;
+      try {
+        const members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
+        const chosen = resolveMain(members, id);
+        persistMainAccount(join(process.cwd(), '.env'), chosen.id);
+        // Update the live config so the change takes effect without a restart.
+        this.cfg.RELIC_MAIN_ACCOUNT = chosen.id;
+        await ctx.answerCallbackQuery({ text: `main = ${chosen.id}` });
+        await this.show(
+          ctx,
+          [
+            '<b>⭐ Main account updated</b>',
+            '',
+            `Now: <b>${ui.esc(chosen.id)}</b>`,
+            ui.code(chosen.address),
+            '',
+            'Saved to <code>.env</code> and applied immediately.',
+          ].join('\n'),
+          ControlBot.backRow(new InlineKeyboard().text('👛 Wallets', 'nav:wallets')),
+        );
+      } catch (err) {
+        await ctx.answerCallbackQuery({ text: 'failed' });
+        await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
+      }
+    });
+
+    this.bot.callbackQuery('wal:export', async (ctx) => {
+      await ctx.answerCallbackQuery();
+      const members = fleetMembers(this.cfg.RELIC_KEYS_DIR);
+      const kb = new InlineKeyboard();
+      for (const m of members) kb.text(`🔑 ${m.id}`, `wal:exp:${m.id}`).row();
+      await this.show(
+        ctx,
+        [
+          '<b>🔑 Export a private key</b>',
+          '',
+          '⚠️ <b>Read this first.</b>',
+          'The key will appear in this chat as JSON. Anyone who sees it',
+          'controls that wallet completely and irreversibly.',
+          '',
+          `The message is deleted automatically after <b>${EXPORT_TTL_S}s</b>, but`,
+          'Telegram may keep it in backups. Do not forward it.',
+          '',
+          'Choose a wallet:',
+        ].join('\n'),
+        ControlBot.backRow(kb),
+      );
+    });
+
+    this.bot.callbackQuery(/^wal:exp:(.+)$/, async (ctx) => {
+      const id = ctx.match![1]!;
+      await ctx.answerCallbackQuery();
+      try {
+        const e = exportWalletJson(this.cfg.RELIC_KEYS_DIR, id);
+        await this.show(
+          ctx,
+          `<b>🔑 ${ui.esc(e.id)}</b>\n${ui.code(e.address)}\n\n<i>Key sent below; it self-deletes.</i>`,
+          ControlBot.backRow(new InlineKeyboard().text('👛 Wallets', 'nav:wallets')),
+        );
+
+        const msg = await ctx.reply(
+          `<pre>${ui.esc(e.json)}</pre>`,
+          { parse_mode: 'HTML' },
+        );
+        const chatId = ctx.chat!.id;
+        setTimeout(() => {
+          void ctx.api.deleteMessage(chatId, msg.message_id).catch(() => {
+            log.warn('could not auto-delete an exported key — tell the operator to remove it');
+          });
+        }, EXPORT_TTL_S * 1000);
+      } catch (err) {
+        await this.show(ctx, `⚠️ ${ui.esc((err as Error).message)}`);
+      }
+    });
+
+    // ---- otak -------------------------------------------------------------
+    this.bot.callbackQuery('otak:toggle', async (ctx) => {
+      this.rebuildProviders();
+      const next = !this.fleet.otak.enabled;
+      this.fleet.otak.setEnabled(next);
+      await ctx.answerCallbackQuery({ text: next ? 'Otak ON' : 'Otak OFF' });
+      return this.viewOtak(ctx);
+    });
+
+    this.bot.callbackQuery('otak:health', async (ctx) => {
+      await ctx.answerCallbackQuery({ text: 'probing…' });
       this.rebuildProviders();
       if (this.keys.configured().length === 0) {
-        return ctx.reply('no provider keys set — running on heuristics only');
+        await this.show(
+          ctx,
+          '<b>🧠 Otak</b>\n\nNo provider keys are set.\nThe bot is running on deterministic heuristics.',
+          ControlBot.backRow(new InlineKeyboard().text('🧠 Otak', 'nav:otak')),
+        );
+        return;
       }
-      await ctx.reply('probing providers…');
-      const health = await this.fleet.otak.checkHealth();
-      return ctx.reply(
-        health.map((h) => `${h.name}: ${h.ok ? 'OK' : 'FAILED'} — ${redact(h.detail)}`).join('\n'),
+      await this.fleet.otak.checkHealth();
+      return this.viewOtak(ctx);
+    });
+
+    this.bot.callbackQuery(/^otak:key:(openai|anthropic|fugu)$/, async (ctx) => {
+      const p = ctx.match![1] as ProviderName;
+      await ctx.answerCallbackQuery();
+      this.pending.set(ctx.chat!.id, { kind: 'otak-key', provider: p });
+      await this.show(
+        ctx,
+        [
+          `<b>🔑 ${ui.esc(p)} API key</b>`,
+          '',
+          'Send the key as your next message.',
+          '',
+          '<i>Your message is deleted immediately, and the key is stored',
+          'encrypted (AES-256-GCM) at 0600 on this server.</i>',
+        ].join('\n'),
+        ControlBot.backRow(),
       );
     });
 
-    // Capture an API key sent as a plain message, then delete it from the chat.
+    // ---- pending free-text input -----------------------------------------
     this.bot.on('message:text', async (ctx) => {
-      const pending = this.awaitingKey.get(ctx.chat.id);
-      if (!pending) return;
-      this.awaitingKey.delete(ctx.chat.id);
+      const p = this.pending.get(ctx.chat.id);
+      if (!p) return;
+      this.pending.delete(ctx.chat.id);
 
-      const key = ctx.message.text.trim();
+      const text = ctx.message.text.trim();
+      // Delete the secret from the chat before doing anything else with it.
       try {
         await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id);
       } catch {
-        log.warn('could not delete the key message — ask the operator to remove it manually');
+        log.warn('could not delete an inbound secret message');
       }
 
-      if (!key || key.length < 8) return ctx.reply('that does not look like an API key — nothing stored');
+      if (p.kind === 'otak-key') {
+        if (text.length < 8) {
+          await ctx.reply('That does not look like an API key — nothing stored.', {
+            parse_mode: 'HTML',
+            reply_markup: ControlBot.backRow(),
+          });
+          return;
+        }
+        this.keys.set(p.provider, text);
+        this.rebuildProviders();
+        const provider = this.buildProvider(p.provider);
+        const h = provider ? await provider.health() : { ok: false, detail: 'not constructed' };
+        await ctx.reply(
+          [
+            `<b>🔑 ${ui.esc(p.provider)} key stored</b>`,
+            '',
+            `Health: ${h.ok ? '✅ OK' : '❌ FAILED'}`,
+            `<i>${ui.esc(redact(h.detail).slice(0, 160))}</i>`,
+          ].join('\n'),
+          { parse_mode: 'HTML', reply_markup: ControlBot.backRow(new InlineKeyboard().text('🧠 Otak', 'nav:otak')) },
+        );
+        return;
+      }
 
-      this.keys.set(pending, key);
-      this.rebuildProviders();
-      const provider = this.buildProvider(pending);
-      const h = provider ? await provider.health() : { ok: false, detail: 'not constructed' };
-      return ctx.reply(
-        `${pending} key stored (encrypted).\nhealth: ${h.ok ? 'OK' : 'FAILED'} — ${redact(h.detail)}`,
-      );
+      // import-wallet
+      try {
+        const w = importWallet(this.cfg.RELIC_KEYS_DIR, text);
+        await ctx.reply(
+          [
+            '<b>✅ Wallet imported</b>',
+            '',
+            `id: <b>${ui.esc(w.id)}</b>`,
+            `address: ${ui.code(w.address)}`,
+            '',
+            'Restart the bot to include it in the running fleet.',
+          ].join('\n'),
+          { parse_mode: 'HTML', reply_markup: ControlBot.backRow(new InlineKeyboard().text('👛 Wallets', 'nav:wallets')) },
+        );
+      } catch (err) {
+        await ctx.reply(`⚠️ ${ui.esc((err as Error).message)}`, {
+          parse_mode: 'HTML',
+          reply_markup: ControlBot.backRow(),
+        });
+      }
+    });
+
+    this.bot.catch((err) => {
+      log.error(`bot error: ${redact(err.message)}`);
     });
   }
+
+  // ----------------------------------------------------------- providers --
 
   private buildProvider(p: ProviderName) {
     const key = this.keys.get(p);
     if (!key) return null;
     if (p === 'openai') return new OpenAIProvider({ apiKey: key });
     if (p === 'anthropic') {
-      const opts: ConstructorParameters<typeof AnthropicProvider>[0] = { apiKey: key };
-      if (process.env.OTAK_ANTHROPIC_MODEL) opts.model = process.env.OTAK_ANTHROPIC_MODEL;
+      const o: ConstructorParameters<typeof AnthropicProvider>[0] = { apiKey: key };
+      if (process.env.OTAK_ANTHROPIC_MODEL) o.model = process.env.OTAK_ANTHROPIC_MODEL;
       const e = process.env.OTAK_ANTHROPIC_EFFORT;
-      if (e === 'low' || e === 'medium' || e === 'high' || e === 'xhigh' || e === 'max') {
-        opts.effort = e;
-      }
-      return new AnthropicProvider(opts);
+      if (e === 'low' || e === 'medium' || e === 'high' || e === 'xhigh' || e === 'max') o.effort = e;
+      return new AnthropicProvider(o);
     }
-    const opts: ConstructorParameters<typeof FuguProvider>[0] = { apiKey: key };
-    if (process.env.FUGU_BASE_URL) opts.baseUrl = process.env.FUGU_BASE_URL;
-    if (process.env.FUGU_MODEL) opts.model = process.env.FUGU_MODEL;
-    return new FuguProvider(opts);
+    const o: ConstructorParameters<typeof FuguProvider>[0] = { apiKey: key };
+    if (process.env.FUGU_BASE_URL) o.baseUrl = process.env.FUGU_BASE_URL;
+    if (process.env.FUGU_MODEL) o.model = process.env.FUGU_MODEL;
+    return new FuguProvider(o);
   }
 
-  /** Rebuild the provider chain, preferred provider first. */
+  /** Rebuild the fallback chain, preferred provider first. */
   rebuildProviders(): void {
-    const preferred = (process.env.OTAK_PROVIDER as ProviderName) ?? 'anthropic';
+    const preferred = this.cfg.OTAK_PROVIDER;
     const order = [preferred, ...PROVIDERS.filter((p) => p !== preferred)];
     const built = order.map((p) => this.buildProvider(p)).filter((p) => p !== null);
     this.fleet.otak.setProviders(built as NonNullable<(typeof built)[number]>[]);
   }
 
+  // --------------------------------------------------------------- alerts --
+
   async notify(text: string): Promise<void> {
     for (const id of this.opts.ownerIds) {
       try {
-        await this.bot.api.sendMessage(id, redact(text));
+        await this.bot.api.sendMessage(id, redact(text), {
+          reply_markup: new InlineKeyboard().text('⚔️ Fleet', 'nav:status').text('🅿️ Parks', 'nav:parks'),
+        });
       } catch (e) {
         log.warn(`notify ${id} failed: ${(e as Error).message}`);
       }
@@ -251,6 +606,17 @@ export class ControlBot {
   async start(): Promise<void> {
     this.rebuildProviders();
     this.fleet.onAlert((a) => this.notify(`[${a.kind.toUpperCase()}] ${a.text}`));
+    await this.bot.api.setMyCommands([
+      { command: 'menu', description: 'Main menu' },
+      { command: 'status', description: 'Fleet status' },
+      { command: 'holdings', description: 'SOL and token balances' },
+      { command: 'wallets', description: 'Create, import, export wallets' },
+      { command: 'sweep', description: 'Collect tokens into the main wallet' },
+      { command: 'fund', description: 'Top up wallets low on gas' },
+      { command: 'gate', description: 'Token-gate state' },
+      { command: 'otak', description: 'The LLM brain' },
+      { command: 'parks', description: 'What is blocked, and why' },
+    ]);
     void this.bot.start({ onStart: () => log.info('telegram control bot online') });
   }
 

@@ -25,11 +25,7 @@ async function main(): Promise<void> {
   let control: ControlBot | null = null;
   if (cfg.TELEGRAM_BOT_TOKEN && cfg.ownerIds.length > 0) {
     control = new ControlBot(
-      {
-        token: cfg.TELEGRAM_BOT_TOKEN,
-        ownerIds: cfg.ownerIds,
-        dataDir: cfg.RELIC_DATA_DIR,
-      },
+      { token: cfg.TELEGRAM_BOT_TOKEN, ownerIds: cfg.ownerIds, cfg },
       fleet,
     );
     await control.start();

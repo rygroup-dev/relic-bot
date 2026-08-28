@@ -35,6 +35,7 @@ export interface Session {
   walletAddress: string;
   character: Character | null;
   characters: Character[];
+  unlocks: string[];
   ban: BanInfo | null;
 }
 
@@ -68,10 +69,15 @@ export class AuthClient {
     const signature = account.signer.signLoginMessage(message);
 
     let res: {
+      /** The live server returns `sessionToken`; `token` is accepted as a
+       *  fallback in case the field is ever renamed back. Verified against
+       *  production 2026-08-28. */
+      sessionToken?: string;
       token?: string;
       walletAddress?: string;
       character?: Character | null;
       characters?: Character[];
+      unlocks?: string[];
       error?: string;
       ban?: BanInfo;
     };
@@ -100,16 +106,21 @@ export class AuthClient {
     if (res.error === 'banned' && res.ban) {
       throw new BannedError(res.ban, account.address);
     }
-    if (!res.token) {
-      throw new Error(`auth/verify returned no token for ${account.id}`);
+    const token = res.sessionToken ?? res.token;
+    if (!token) {
+      throw new Error(
+        `auth/verify returned no sessionToken for ${account.id} ` +
+          `(fields: ${Object.keys(res).join(', ') || 'none'})`,
+      );
     }
 
     log.info(`${account.id} authenticated as ${account.address.slice(0, 8)}…`);
     return {
-      token: res.token,
+      token,
       walletAddress: res.walletAddress ?? account.address,
       character: res.character ?? null,
       characters: res.characters ?? [],
+      unlocks: res.unlocks ?? [],
       ban: res.ban ?? null,
     };
   }

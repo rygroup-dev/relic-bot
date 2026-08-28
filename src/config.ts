@@ -34,6 +34,18 @@ const Schema = z.object({
   // --- liveness watchdog (output-based, not error-based) ---
   WATCHDOG_SILENCE_MIN: num(25),
 
+  // --- treasury (the only transaction-signing surface) ---
+  /** Wallet id or address that sweeps collect into. Blank = first wallet. */
+  RELIC_MAIN_ACCOUNT: z.string().optional(),
+  /** Top up a wallet when it falls below this many SOL. */
+  GAS_MIN_SOL: num(0.003),
+  /** How much SOL a single top-up sends. */
+  GAS_TOPUP_SOL: num(0.01),
+  /** Hard cap on any single gas transfer, regardless of the above. */
+  GAS_MAX_SOL: num(0.05),
+  /** Sweep residual SOL too, not just tokens. */
+  SWEEP_INCLUDE_SOL: bool(false),
+
   // --- selling ---
   SELL_ENABLED: bool(true),
   SELL_MIN_NET_MICRO_USDC: num(50_000), // ignore loot worth < $0.05 net
