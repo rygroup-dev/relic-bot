@@ -112,6 +112,28 @@ describe('REGRESSION: the hero must be able to see itself', () => {
     const player = { col: 1, row: 2, hp: 70, maxHp: 70, boneShield: 12 };
     expect(readSelf({ players: { abc: player } }, 'abc').raw).toEqual(player);
   });
+
+  it('skips an empty declared string when resolving a mob name', async () => {
+    const { readEntities } = await import('../src/game/state.js');
+    // Colyseus declares every string on a schema and sends '' until the server
+    // assigns it. '' is not undefined, so the old pick() stopped on the empty
+    // `name` and never tried `displayName` — mob names came back blank
+    // (`approaching  — 12 cells away`), which broke mobName() and made every
+    // recorded loss land on 'unknown'.
+    const [mob] = readEntities({
+      mobs: { mob_1: { id: 'mob_1', name: '', displayName: 'Tomb Necromancer', col: 5, row: 5, hp: 30, maxHp: 30 } },
+    });
+    expect(mob!.name).toBe('Tomb Necromancer');
+  });
+
+  it('falls back to the collection key only when every candidate is blank', async () => {
+    const { readEntities } = await import('../src/game/state.js');
+    const [mob] = readEntities({
+      mobs: { mob_1: { id: 'mob_1', name: '', displayName: '   ', col: 5, row: 5, hp: 30 } },
+    });
+    // Never an empty string: the name reaches logs and combat memory keys.
+    expect(mob!.name).toBe('mobs');
+  });
 });
 
 describe('REGRESSION: a death must be recorded as a loss', () => {

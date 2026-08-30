@@ -70,6 +70,25 @@ function pick(obj: unknown, keys: readonly string[]): unknown {
   return undefined;
 }
 
+/**
+ * Like `pick`, but skips a present-yet-empty string.
+ *
+ * Colyseus declares every string field on a schema and sends `''` until the
+ * server assigns it. `''` is not `undefined`, so plain `pick` accepted it and
+ * stopped, never reaching the next candidate key. Mob names came back empty as
+ * a result — logs read `approaching  — 12 cells away` — which broke `mobName()`
+ * and made every recorded combat loss land on 'unknown'.
+ */
+function pickText(obj: unknown, keys: readonly string[]): string | null {
+  if (!obj || typeof obj !== 'object') return null;
+  const rec = obj as Record<string, unknown>;
+  for (const k of keys) {
+    const v = rec[k];
+    if (typeof v === 'string' && v.trim() !== '') return v;
+  }
+  return null;
+}
+
 export function readPos(o: unknown): Vec2 | null {
   const x = num(pick(o, ['x', 'posX', 'col']));
   const y = num(pick(o, ['y', 'posY', 'row']));
@@ -128,10 +147,15 @@ export function readEntities(state: unknown): EntityView[] {
         kind: classify(collectionKey, v),
         // Dungeon mobs carry displayName / hoverName rather than `name`,
         // verified from a live dungeon state dump.
-        name: String(
-          pick(v, ['name', 'displayName', 'hoverName', 'label', 'monsterId', 'charId']) ??
-            collectionKey,
-        ),
+        //
+        // Read with pickText, not pick: Colyseus sends every declared string as
+        // `''` until the server fills it, and `''` is not `undefined`, so plain
+        // pick stopped on the empty `name` and never tried `displayName`. Mob
+        // names came back blank for the bot's whole life, which also meant every
+        // combat loss was attributed to 'unknown'.
+        name:
+          pickText(v, ['name', 'displayName', 'hoverName', 'label', 'monsterId', 'charId']) ??
+          collectionKey,
         pos,
         hp,
         maxHp: num(pick(v, ['maxHp', 'hpMax', 'maxHealth'])),
