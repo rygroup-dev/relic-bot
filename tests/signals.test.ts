@@ -4,36 +4,121 @@ import { SignalState, SIG, VALUE_SIGNALS } from '../src/net/signals.js';
 const ME = 'my-session';
 
 describe('inventory arrives on a signal, not in room state', () => {
-  it('populates from s.inv.sync', () => {
+  // Real `s.inv.sync` payload, captured from a live dungeon 2026-08-30:
+  //   { gold, pxp, capacity, instances[], stacks[], stashInstances[],
+  //     stashStacks[], containers{}, artifactPointsAvailable, ... }
+  //
+  // The tests below used to assert an `items: [{ instanceId, consumable }]`
+  // shape that the server never sends. They passed while the parser matched
+  // nothing on the live server, so the bag was empty for the bot's whole life
+  // and every potion/equip/sell decision was dead code. Fixtures are now the
+  // observed shape.
+  const gear = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: 'inst_1',
+    defId: 'sword_iron',
+    name: 'Iron Blade',
+    rarity: 'epic',
+    slot: 'weapon',
+    classId: 'knight',
+    ilvl: 12,
+    levelReq: 5,
+    state: 'inventory',
+    equippedSlot: -1,
+    ...over,
+  });
+
+  const stack = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    itemId: 'pot_hp',
+    name: 'Health Potion',
+    rarity: 'common',
+    quantity: 3,
+    soulbound: false,
+    ...over,
+  });
+
+  it('parses instances and stacks from the real payload', () => {
     const s = new SignalState();
-    s.apply(SIG.INV_SYNC, {
-      items: [
-        { instanceId: 'i1', name: 'Health Potion', consumable: true, quantity: 3 },
-        { instanceId: 'i2', name: 'Iron Blade', slot: 'weapon', rarity: 'epic' },
-      ],
-    }, ME);
+    s.apply(SIG.INV_SYNC, { gold: 500, capacity: 40, instances: [gear()], stacks: [stack()] }, ME);
+
     expect(s.inventory).toHaveLength(2);
-    expect(s.inventory[0]!.name).toBe('Health Potion');
-    expect(s.inventory[1]!.slot).toBe('weapon');
+    const blade = s.inventory.find((i) => i.name === 'Iron Blade')!;
+    // `id` is the instance handle, NOT `instanceId` — i.inv.equip needs it.
+    expect(blade.instanceId).toBe('inst_1');
+    expect(blade.slot).toBe('weapon');
+    expect(blade.ilvl).toBe(12);
+    expect(blade.levelReq).toBe(5);
+    expect(blade.consumable).toBe(false);
+
+    const potion = s.inventory.find((i) => i.name === 'Health Potion')!;
+    expect(potion.itemId).toBe('pot_hp');
+    expect(potion.quantity).toBe(3);
+    // No `consumable` flag exists server-side; it is inferred from the name.
+    expect(potion.consumable).toBe(true);
   });
 
-  it('accepts the alternative field names without inventing data', () => {
+  it('reads gold and capacity off the same sync', () => {
     const s = new SignalState();
-    s.apply(SIG.INV_SYNC, { inventory: [{ itemId: 'x', name: 'Thing' }] }, ME);
-    expect(s.inventory).toHaveLength(1);
+    s.apply(SIG.INV_SYNC, { gold: 1234, capacity: 40, instances: [], stacks: [] }, ME);
+    expect(s.gold).toBe(1234);
+    expect(s.capacity).toBe(40);
   });
 
-  it('ignores a malformed sync rather than clearing what it knows', () => {
+  it('detects worn gear from state or equippedSlot, not an equipped boolean', () => {
     const s = new SignalState();
-    s.apply(SIG.INV_SYNC, { items: [{ name: 'Keeper' }] }, ME);
+    s.apply(
+      SIG.INV_SYNC,
+      {
+        instances: [
+          gear({ id: 'a', state: 'equipped', equippedSlot: -1 }),
+          gear({ id: 'b', state: 'inventory', equippedSlot: 2 }),
+          gear({ id: 'c', state: 'inventory', equippedSlot: -1 }),
+        ],
+        stacks: [],
+      },
+      ME,
+    );
+    const byId = new Map(s.inventory.map((i) => [i.instanceId, i]));
+    // Both signals must count: treating worn gear as spare would make the bot
+    // re-equip or list what it is wearing.
+    expect(byId.get('a')!.equipped).toBe(true);
+    expect(byId.get('b')!.equipped).toBe(true);
+    expect(byId.get('c')!.equipped).toBe(false);
+  });
+
+  it('ignores a sync carrying neither array rather than clearing the bag', () => {
+    const s = new SignalState();
+    s.apply(SIG.INV_SYNC, { instances: [gear()], stacks: [] }, ME);
     s.apply(SIG.INV_SYNC, { nonsense: true }, ME);
     expect(s.inventory).toHaveLength(1);
   });
 
-  it('drops entries with no usable name', () => {
+  it('drops elements missing the id the server needs to act on them', () => {
     const s = new SignalState();
-    s.apply(SIG.INV_SYNC, { items: [{}, { name: 'Real' }] }, ME);
-    expect(s.inventory.map((i) => i.name)).toEqual(['Real']);
+    s.apply(
+      SIG.INV_SYNC,
+      {
+        // No `id` — unusable for i.inv.equip. No `name` — unusable for pricing.
+        instances: [{ name: 'Nameless' }, gear({ id: 'ok', name: 'Real Blade' })],
+        stacks: [{ quantity: 1 }, stack({ itemId: 'ok_pot', name: 'Real Potion' })],
+      },
+      ME,
+    );
+    expect(s.inventory.map((i) => i.name).sort()).toEqual(['Real Blade', 'Real Potion']);
+  });
+
+  it('excludes the stash: it is town storage and cannot be used mid-run', () => {
+    const s = new SignalState();
+    s.apply(
+      SIG.INV_SYNC,
+      {
+        instances: [gear()],
+        stacks: [],
+        stashInstances: [gear({ id: 'stashed', name: 'Stashed Blade' })],
+        stashStacks: [stack({ itemId: 'stashed_pot', name: 'Stashed Potion' })],
+      },
+      ME,
+    );
+    expect(s.inventory.map((i) => i.name)).toEqual(['Iron Blade']);
   });
 });
 
@@ -136,7 +221,7 @@ describe('survival signals', () => {
 describe('run lifecycle', () => {
   it('resets per-run counters but keeps inventory', () => {
     const s = new SignalState();
-    s.apply(SIG.INV_SYNC, { items: [{ name: 'Potion' }] }, ME);
+    s.apply(SIG.INV_SYNC, { stacks: [{ itemId: 'pot', name: 'Potion', quantity: 1 }] }, ME);
     s.apply(SIG.LOOT_GOLD, { amount: 50 }, ME);
     s.apply(SIG.DEATH, { id: ME }, ME);
     s.resetRun();

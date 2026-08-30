@@ -92,6 +92,68 @@ export interface InventoryEntry {
   quantity?: number;
   equipped?: boolean;
   consumable?: boolean;
+  /** Item level, instances only. The server's own power ordering. */
+  ilvl?: number;
+  /** Level required to equip. Equipping below this is refused. */
+  levelReq?: number;
+  /** Class an instance is restricted to, when it is restricted. */
+  classId?: string;
+}
+
+/**
+ * Parse one `instances[]` element — equipment.
+ *
+ * Real shape, captured live 2026-08-30:
+ *   { id, defId, name, rarity, slot, classId, ilvl, levelReq, dropRebirthLevel,
+ *     hasGemSocket, gemSocketCount, socketedGemIds[], affixes{}, lines[],
+ *     state, equippedSlot, iconUrl }
+ *
+ * Note `id` — NOT `instanceId` — and `equippedSlot`/`state` rather than an
+ * `equipped` boolean.
+ */
+function parseInstance(r: Record<string, unknown>): InventoryEntry | null {
+  const name = typeof r.name === 'string' ? r.name : null;
+  const id = typeof r.id === 'string' ? r.id : null;
+  if (!name || !id) return null;
+
+  const e: InventoryEntry = { name, instanceId: id, consumable: false };
+  if (typeof r.defId === 'string') e.itemId = r.defId;
+  if (typeof r.slot === 'string') e.slot = r.slot;
+  if (typeof r.rarity === 'string') e.rarity = r.rarity;
+  if (typeof r.classId === 'string') e.classId = r.classId;
+  if (typeof r.ilvl === 'number') e.ilvl = r.ilvl;
+  if (typeof r.levelReq === 'number') e.levelReq = r.levelReq;
+
+  // Two independent signals for "is this worn". Both are accepted because the
+  // exact vocabulary of `state` is not yet confirmed, and treating an equipped
+  // item as spare would make the bot try to re-equip or sell what it is wearing.
+  const state = typeof r.state === 'string' ? r.state.toLowerCase() : null;
+  const slotIdx = typeof r.equippedSlot === 'number' ? r.equippedSlot : null;
+  e.equipped = state === 'equipped' || (slotIdx !== null && slotIdx >= 0);
+  return e;
+}
+
+/**
+ * Parse one `stacks[]` element — consumables and materials.
+ *
+ * Real shape: { itemId, name, rarity, quantity, iconUrl, soulbound }.
+ * There is NO `consumable` flag, so it is inferred from the name: potions and
+ * food are the only stackables worth using mid-run.
+ */
+function parseStack(r: Record<string, unknown>): InventoryEntry | null {
+  const name = typeof r.name === 'string' ? r.name : null;
+  const itemId = typeof r.itemId === 'string' ? r.itemId : null;
+  if (!name || !itemId) return null;
+
+  const e: InventoryEntry = { name, itemId };
+  if (typeof r.rarity === 'string') e.rarity = r.rarity;
+  if (typeof r.quantity === 'number') e.quantity = r.quantity;
+  // Consumable by name: the server does not label it. Conservative on purpose —
+  // a misclassified gem would be "used" every tick and refused every tick.
+  e.consumable = /potion|elixir|flask|draught|tonic|food|ration|bread|meat|fruit|remedy|salve/i.test(
+    name,
+  );
+  return e;
 }
 
 /**
@@ -106,6 +168,8 @@ export class SignalState {
   private _xp: number | null = null;
   private _cooldowns = new Map<string, number>();
   private _dead = false;
+  /** Carried-inventory slot capacity, from `s.inv.sync`. */
+  private _capacity: number | null = null;
   private _lastTelegraphAt = 0;
   private _resync: { col: number; row: number } | null = null;
   private _goldGained = 0;
@@ -124,6 +188,10 @@ export class SignalState {
   }
   get dead(): boolean {
     return this._dead;
+  }
+  /** Carried inventory capacity, null until the first sync. */
+  get capacity(): number | null {
+    return this._capacity;
   }
   get goldGained(): number {
     return this._goldGained;
@@ -164,24 +232,59 @@ export class SignalState {
   apply(type: string, payload: unknown, selfId: string | null): void {
     switch (type) {
       case SIG.INV_SYNC: {
-        const list = pick(payload, ['items', 'inventory', 'entries']);
-        if (Array.isArray(list)) {
-          this._inventory = list
-            .filter((v): v is Record<string, unknown> => Boolean(v) && typeof v === 'object')
-            .map((r) => {
-              const name = typeof r.name === 'string' ? r.name : String(r.itemId ?? '');
-              const e: InventoryEntry = { name };
-              if (typeof r.instanceId === 'string') e.instanceId = r.instanceId;
-              if (typeof r.itemId === 'string') e.itemId = r.itemId;
-              if (typeof r.slot === 'string') e.slot = r.slot;
-              if (typeof r.rarity === 'string') e.rarity = r.rarity;
-              if (typeof r.quantity === 'number') e.quantity = r.quantity;
-              if (typeof r.equipped === 'boolean') e.equipped = r.equipped;
-              if (typeof r.consumable === 'boolean') e.consumable = r.consumable;
-              return e;
-            })
-            .filter((e) => e.name.length > 0);
-          log.debug(`inventory sync: ${this._inventory.length} item(s)`);
+        // Real payload, captured live 2026-08-30, is NOT a flat list:
+        //   { gold, pxp, capacity, instances[], stacks[], stashInstances[],
+        //     stashStacks[], containers{}, artifactPointsAvailable, ... }
+        //
+        // The previous code probed `items` / `inventory` / `entries` — none of
+        // which exist — so `_inventory` stayed empty for the bot's entire life.
+        // That silently disabled potions, equipping AND selling: every
+        // inventory-driven decision was dead code, which is why the fleet wiped
+        // at depth 1 with a bag full of unused gear.
+        //
+        // `stash*` is deliberately excluded: it is town storage, not carried,
+        // and cannot be used or equipped mid-run.
+        const rec = (payload && typeof payload === 'object'
+          ? (payload as Record<string, unknown>)
+          : {}) as Record<string, unknown>;
+
+        const objects = (v: unknown): Record<string, unknown>[] =>
+          Array.isArray(v)
+            ? v.filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === 'object')
+            : [];
+
+        const next: InventoryEntry[] = [];
+        for (const r of objects(rec.instances)) {
+          const e = parseInstance(r);
+          if (e) next.push(e);
+        }
+        for (const r of objects(rec.stacks)) {
+          const e = parseStack(r);
+          if (e) next.push(e);
+        }
+
+        // Only replace on a payload that actually carried the arrays. A partial
+        // sync must not silently empty the bag.
+        if (Array.isArray(rec.instances) || Array.isArray(rec.stacks)) {
+          this._inventory = next;
+          const gold = num(rec.gold);
+          if (gold !== null) this._gold = gold;
+          this._capacity = num(rec.capacity);
+          log.debug(
+            `inventory sync: ${next.length} item(s) ` +
+              `(${next.filter((e) => !e.consumable).length} gear, ` +
+              `${next.filter((e) => e.consumable).length} consumable)` +
+              // Names and slots, so a "nothing ever equips" symptom can be told
+              // apart from "there is nothing worth equipping".
+              (next.length > 0
+                ? `: ${next
+                    .map(
+                      (e) =>
+                        `${e.name}[${e.consumable ? `x${e.quantity ?? 1}` : `${e.slot ?? 'noslot'} ilvl${e.ilvl ?? '?'}${e.equipped ? ' WORN' : ''}`}]`,
+                    )
+                    .join(', ')}`
+                : ''),
+          );
         }
         break;
       }
