@@ -306,15 +306,28 @@ export function characterIntents(
     classId?: ClassId | null;
     unspentPoints?: number;
     tuning?: SurvivalTuning;
+    /**
+     * Hero level, when a more reliable source than `self.level` is available.
+     *
+     * The room-state read is null until the dungeon schema lands, and
+     * equipIntent() skips any item whose `levelReq` it cannot clear — so a null
+     * level silently blocked every equip. The caller passes the level from the
+     * signal stream, which is authoritative on every kill.
+     */
+    level?: number | null;
   } = {},
 ): ActionIntent[] {
   const tuning = opts.tuning ?? DEFAULT_SURVIVAL;
+  // Level is overridden rather than merged so an explicit null from the caller
+  // still means "unknown", not "fall back to the stale state read".
+  const view: SelfView =
+    opts.level !== undefined && opts.level !== self.level ? { ...self, level: opts.level } : self;
   const out: (ActionIntent | null)[] = [
-    healingIntent(self, inventory, tuning),
+    healingIntent(view, inventory, tuning),
     chestIntent(entities),
-    castIntent(self, opts.abilities ?? [], opts.targetId ?? null),
-    equipIntent(inventory, self, opts.classId ?? null),
-    manaIntent(self, inventory, tuning),
+    castIntent(view, opts.abilities ?? [], opts.targetId ?? null),
+    equipIntent(inventory, view, opts.classId ?? null),
+    manaIntent(view, inventory, tuning),
     attributeIntent(opts.classId ?? null, opts.unspentPoints ?? 0),
   ];
   return out

@@ -706,6 +706,11 @@ export class AccountRunner {
       targetId,
       abilities: this.abilities(),
       unspentPoints: this.unspentPoints(),
+      // The level from the state read can be null before the dungeon schema
+      // lands, and equipIntent() skips every item whose levelReq it cannot
+      // clear — so a null level meant nothing was ever equipped. The signal
+      // stream carries an authoritative level on every kill.
+      level: this.heroLevel(self),
     });
     if (intents.length === 0) return false;
 
@@ -911,6 +916,18 @@ export class AccountRunner {
     return self.bonusAttrPoints !== null && self.bonusAttrPoints > 0
       ? Math.floor(self.bonusAttrPoints)
       : 0;
+  }
+
+  /**
+   * Level from whichever source actually has it.
+   *
+   * The signal stream is preferred: `s.combat.xp` carries an authoritative
+   * `level` on every kill, whereas the room-state read depends on the dungeon
+   * schema having landed. Used for the equip level-requirement check, which
+   * silently skipped every item while the level read as null.
+   */
+  private heroLevel(self: SelfView): number | null {
+    return this.signals.level ?? self.level ?? this.session?.character?.level ?? null;
   }
 
   /** One decision inside a dungeon, where the mobs actually are. */

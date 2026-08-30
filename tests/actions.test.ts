@@ -162,6 +162,28 @@ describe('equipment upgrades', () => {
     ];
     expect(equipIntent(inv, self(), 'necromancer')).not.toBeNull();
   });
+
+  it('uses the caller-supplied level, not the stale state read', () => {
+    // The room-state level is null until the dungeon schema lands. The caller
+    // passes the level from the signal stream, which is authoritative on every
+    // kill, and that override has to win over the state read.
+    const inv: InventoryItem[] = [
+      { instanceId: 'b', name: 'Endgame Blade', slot: 'weapon', rarity: 'mythic', ilvl: 90, levelReq: 40 },
+    ];
+    const offered = (level: number | null | undefined): boolean =>
+      characterIntents(self({ level: 5 }), inv, [], level === undefined ? {} : { level }).some(
+        (i) => i.type === MSG.INV_EQUIP,
+      );
+
+    // State says 5, which cannot wear a levelReq-40 item.
+    expect(offered(undefined)).toBe(false);
+    // The signal stream says 40, and it wins.
+    expect(offered(40)).toBe(true);
+    // An explicit null means "unknown" and must not silently reuse the stale 5.
+    // Unknown is attempted rather than blocked, matching tooHurtToFight(): a
+    // refused equip is recoverable, whereas never equipping is permanent.
+    expect(offered(null)).toBe(true);
+  });
 });
 
 describe('chests are free value', () => {

@@ -138,6 +138,34 @@ describe('value tracking', () => {
     expect(s.xpGained).toBe(12);
   });
 
+  it('reads level and the running gold total off s.combat.xp', () => {
+    const s = new SignalState();
+    // Real payload: { amount, xp, level, gold, leveledUp }. `level` and `gold`
+    // were both ignored, and s.loot.gold carries no running total at all
+    // (its real shape is { amount, col, row, big, golden }), so the bot never
+    // knew its own gold or level from the signal stream.
+    s.apply(SIG.COMBAT_XP, { amount: 5, xp: 120, level: 7, gold: 940, leveledUp: false }, ME);
+    expect(s.level).toBe(7);
+    expect(s.gold).toBe(940);
+  });
+
+  it('latches a level-up and hands it over exactly once', () => {
+    const s = new SignalState();
+    s.apply(SIG.COMBAT_XP, { amount: 5, level: 7, leveledUp: true }, ME);
+    // Drained, not read: a level-up grants attribute points, and the spend must
+    // happen once — not on every tick that follows.
+    expect(s.takeLevelUp()).toBe(true);
+    expect(s.takeLevelUp()).toBe(false);
+  });
+
+  it('infers a level-up from a rising level even without the flag', () => {
+    const s = new SignalState();
+    s.apply(SIG.COMBAT_XP, { amount: 1, level: 5 }, ME);
+    expect(s.takeLevelUp()).toBe(false);
+    s.apply(SIG.COMBAT_XP, { amount: 1, level: 6 }, ME);
+    expect(s.takeLevelUp()).toBe(true);
+  });
+
   it('ignores a non-numeric amount instead of counting it as zero', () => {
     const s = new SignalState();
     s.apply(SIG.LOOT_GOLD, { amount: 'lots' }, ME);

@@ -166,6 +166,14 @@ export class SignalState {
   private _inventory: InventoryEntry[] = [];
   private _gold: number | null = null;
   private _xp: number | null = null;
+  /** Level, from the authoritative `s.combat.xp` payload. */
+  private _level: number | null = null;
+  /**
+   * Set when the server says a level was gained. Latched, not momentary: the
+   * caller drains it, because a level-up grants attribute points and the tick
+   * that notices must be free to act on them.
+   */
+  private _leveledUp = false;
   private _cooldowns = new Map<string, number>();
   private _dead = false;
   /** Carried-inventory slot capacity, from `s.inv.sync`. */
@@ -185,6 +193,21 @@ export class SignalState {
   }
   get xp(): number | null {
     return this._xp;
+  }
+  /** Level as the server last reported it on `s.combat.xp`. */
+  get level(): number | null {
+    return this._level;
+  }
+  /**
+   * Take the pending level-up notice, if any.
+   *
+   * Drained rather than read so a single level-up triggers exactly one attribute
+   * spend, however many ticks pass before the caller gets to it.
+   */
+  takeLevelUp(): boolean {
+    const up = this._leveledUp;
+    this._leveledUp = false;
+    return up;
   }
   get dead(): boolean {
     return this._dead;
@@ -290,6 +313,10 @@ export class SignalState {
       }
 
       case SIG.LOOT_GOLD: {
+        // Real payload: { amount, col, row, big, golden }. There is NO running
+        // total here — `total`/`balance` were probed and neither exists, so
+        // `_gold` was never once set from a gold pickup. The authoritative total
+        // arrives on s.combat.xp instead (see below).
         const amount = num(pick(payload, ['amount', 'gold', 'value']));
         const total = num(pick(payload, ['total', 'balance']));
         if (amount !== null && amount > 0) this._goldGained += amount;
@@ -299,10 +326,28 @@ export class SignalState {
 
       case SIG.LOOT_PXP:
       case SIG.COMBAT_XP: {
+        // Real s.combat.xp payload: { amount, xp, level, gold, leveledUp }.
+        //
+        // `level`, `gold` and `leveledUp` were all ignored. That mattered:
+        // `gold` is the running total the gold-pickup signal does not carry, and
+        // `leveledUp` is the only positive notice that attribute points were
+        // just granted — everything else had to infer it by polling room state.
         const amount = num(pick(payload, ['amount', 'xp', 'value']));
         const total = num(pick(payload, ['total', 'xp']));
         if (amount !== null && amount > 0) this._xpGained += amount;
         if (total !== null) this._xp = total;
+
+        const gold = num(pick(payload, ['gold']));
+        if (gold !== null) this._gold = gold;
+
+        const level = num(pick(payload, ['level']));
+        if (level !== null) {
+          if (this._level !== null && level > this._level) this._leveledUp = true;
+          this._level = level;
+        }
+        // Trust the server's own flag over the comparison when it is present.
+        const flag = pick(payload, ['leveledUp']);
+        if (flag === true) this._leveledUp = true;
         break;
       }
 
@@ -372,5 +417,11 @@ export class SignalState {
     this._kills = [];
     this._dead = false;
     this._lastTelegraphAt = 0;
+    // Cleared with the other per-run state. Losing an unacted notice is safe
+    // because it is only a notice: the attribute spend is driven by
+    // `bonusAttrPoints` on the player record, which stays non-zero until the
+    // points are actually spent. `_level` and `_gold` are server truth about the
+    // character rather than the run, so they deliberately survive.
+    this._leveledUp = false;
   }
 }
