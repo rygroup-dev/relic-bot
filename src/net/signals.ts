@@ -180,6 +180,15 @@ export class SignalState {
   private _capacity: number | null = null;
   private _lastTelegraphAt = 0;
   private _resync: { col: number; row: number } | null = null;
+  /**
+   * Route the server last computed for us, from `s.path`.
+   *
+   * Server-authoritative and wall-aware, which is the whole point: the bot's own
+   * dead reckoning cannot see walls and got refused against them.
+   */
+  private _path: { col: number; row: number }[] = [];
+  private _pathFrom: { col: number; row: number } | null = null;
+  private _pathAt = 0;
   private _goldGained = 0;
   private _xpGained = 0;
   /** Mob deaths observed this run, with whatever name the server gave. */
@@ -235,6 +244,31 @@ export class SignalState {
     const r = this._resync;
     this._resync = null;
     return r;
+  }
+
+  /**
+   * The route the server last handed back, if it is still fresh.
+   *
+   * Staleness matters: a path computed for a position we have since left would
+   * walk the hero backwards. `maxAgeMs` bounds that. `now` is injectable for the
+   * same reason `underTelegraph()` takes it — a test must not depend on whether
+   * two calls land in the same millisecond.
+   */
+  path(maxAgeMs = 5_000, now = Date.now()): readonly { col: number; row: number }[] {
+    if (this._path.length === 0) return [];
+    return now - this._pathAt <= maxAgeMs ? this._path : [];
+  }
+
+  /** Cell the server said the last route started from. */
+  get pathFrom(): { col: number; row: number } | null {
+    return this._pathFrom;
+  }
+
+  /** Drop the stored route once it has been consumed or invalidated. */
+  clearPath(): void {
+    this._path = [];
+    this._pathFrom = null;
+    this._pathAt = 0;
   }
 
   /** True when an attack telegraph landed recently enough to still matter. */
@@ -405,6 +439,37 @@ export class SignalState {
         break;
       }
 
+      case SIG.PATH: {
+        // Real payload: { seq, fc, fr, cells:[...] } — a flat number array of
+        // col,row pairs, observed up to 154 entries long. The server pathfinds
+        // for us: an `i.move` naming a distant cell is answered with the whole
+        // route, walls avoided.
+        //
+        // This case did not exist. `s.path` was declared in SIG and then never
+        // handled, so the one signal that says "your move was accepted, here is
+        // the way" was dropped on the floor while the bot guessed single steps
+        // and got refused against walls.
+        const cells = pick(payload, ['cells']);
+        const fc = num(pick(payload, ['fc']));
+        const fr = num(pick(payload, ['fr']));
+        if (!Array.isArray(cells)) break;
+
+        const route: { col: number; row: number }[] = [];
+        // Pairs. An odd tail would silently shift every later cell by one, so a
+        // malformed array is rejected outright rather than half-read.
+        if (cells.length % 2 !== 0) break;
+        for (let i = 0; i < cells.length; i += 2) {
+          const c = num(cells[i]);
+          const r = num(cells[i + 1]);
+          if (c === null || r === null) return;
+          route.push({ col: c, row: r });
+        }
+        this._path = route;
+        this._pathFrom = fc !== null && fr !== null ? { col: fc, row: fr } : null;
+        this._pathAt = Date.now();
+        break;
+      }
+
       default:
         break;
     }
@@ -417,6 +482,9 @@ export class SignalState {
     this._kills = [];
     this._dead = false;
     this._lastTelegraphAt = 0;
+    // A route from the previous floor is worse than none: the cells are valid
+    // coordinates in a dungeon that no longer exists.
+    this.clearPath();
     // Cleared with the other per-run state. Losing an unacted notice is safe
     // because it is only a notice: the attribute spend is driven by
     // `bonusAttrPoints` on the player record, which stays non-zero until the

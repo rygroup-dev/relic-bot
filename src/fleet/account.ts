@@ -744,22 +744,57 @@ export class AccountRunner {
   }
 
   /**
-   * Send one cardinal step from `here` toward `to`. Returns false when already
-   * there.
+   * Move one step toward `to`, following the server's route when it gave one.
    *
-   * Cardinal-only, and the reason is load-bearing: a diagonal `i.move` is
-   * refused by the server every time, which is what pinned the hero at its
-   * spawn cell and stopped it ever attacking. Shared by mob approach and prop
-   * approach so the rule cannot be re-broken in one of them.
+   * The server pathfinds. `s.path` answers an `i.move` with the whole wall-aware
+   * route as `{ seq, fc, fr, cells }` — up to 154 cells observed — so naming a
+   * distant destination and walking the reply beats guessing.
+   *
+   * That was the missing half of the diagonal fix. Cardinal single-stepping got
+   * two of eight wallets moving; the other two stayed pinned at their spawn cell
+   * for 30 unbroken minutes, because a cardinal step into a wall is refused just
+   * as flatly as a diagonal one. Dead reckoning cannot see walls at all.
+   *
+   * Order of preference:
+   *   1. the next cell of a fresh `s.path`, when it starts where we are
+   *   2. a fresh `i.move` naming the destination, letting the server route it
+   *   3. a cardinal step, as the fallback when no route came back
+   *
+   * Returns false only when already standing on the destination.
    */
   private stepToward(
     room: { send: (t: string, p?: unknown) => void },
     here: Cell,
     to: Cell,
   ): boolean {
+    if (here.col === to.col && here.row === to.row) return false;
+
+    const route = this.signals.path();
+    if (route.length > 0) {
+      // Find where we are on the route and take the cell after it. Matching on
+      // position rather than trusting index 0 keeps a partially-walked route
+      // usable and avoids stepping backwards.
+      const at = route.findIndex((c) => c.col === here.col && c.row === here.row);
+      const next = at >= 0 ? route[at + 1] : route[0];
+      if (next && (next.col !== here.col || next.row !== here.row)) {
+        room.send(MSG.MOVE, { col: next.col, row: next.row, seq: ++this.moveSeq });
+        return true;
+      }
+      // Route exhausted or no longer relevant to where we stand.
+      this.signals.clearPath();
+    }
+
     const dCol = to.col - here.col;
     const dRow = to.row - here.row;
-    if (dCol === 0 && dRow === 0) return false;
+    const far = Math.abs(dCol) + Math.abs(dRow) > 1;
+    if (far) {
+      // Ask the server to route us. It answers on `s.path`, which the next tick
+      // will walk. A destination-move is what the real client sends.
+      room.send(MSG.MOVE, { col: to.col, row: to.row, seq: ++this.moveSeq });
+      return true;
+    }
+
+    // Adjacent: a single cardinal step is unambiguous and needs no route.
     const step =
       Math.abs(dCol) >= Math.abs(dRow)
         ? { col: here.col + Math.sign(dCol), row: here.row }
@@ -771,23 +806,17 @@ export class AccountRunner {
   /**
    * Step toward the nearest living mob.
    *
-   * Moves in a straight line rather than pathfinding: the dungeon is
-   * procedural and no collision map is published for it, so a BFS would be
-   * guessing at walls. The server refuses illegal moves and reports where we
-   * really are via `s.move.denied`, which is better truth than a map we do
-   * not have.
+   * Movement itself lives in `stepToward()`: the server pathfinds via `s.path`,
+   * and this only decides which mob to head for.
    *
-   * ONE AXIS PER STEP. This sent `{ col: col+dx, row: row+dy }` with both
-   * deltas non-zero — a diagonal — and the server refused every single one:
-   * 14 `s.move.denied` against 0 `s.path` in a 10-minute window, with the hero
-   * pinned at its spawn cell and the resync echoing that same cell back. The
-   * town pathfinder in `world.ts` only ever emits cardinal neighbours
-   * ([1,0] [-1,0] [0,1] [0,-1]) and walking to the trapdoor always worked, so
-   * cardinal-only is the movement rule the server enforces.
-   *
-   * Consequence of the diagonal: distance stuck at 12 cells against a
-   * `maxEngageDistance` of 12, so `combatCandidates()` was always empty and the
-   * bot never attacked once — in a room with 66 mobs.
+   * Two movement bugs were found here in sequence, both fatal to combat and both
+   * silent. First, `{ col: col+dx, row: row+dy }` sent a diagonal, which the
+   * server refuses outright — 14 `s.move.denied` against 0 `s.path` in ten
+   * minutes, the hero pinned at spawn, distance frozen at 12 cells against a
+   * `maxEngageDistance` of 12, so `combatCandidates()` stayed empty and the bot
+   * never attacked once in a room holding 66 mobs. Then cardinal single-stepping
+   * fixed only the wallets that happened to spawn with a clear line: two of eight
+   * kept standing still for 30 minutes, because dead reckoning walks into walls.
    */
   private approachNearestMob(
     room: { send: (t: string, p?: unknown) => void },
@@ -807,6 +836,10 @@ export class AccountRunner {
 
     // A server-supplied resync always wins over our own dead reckoning.
     const resync = this.signals.takeResync();
+    // A refused move means the stored route no longer describes where we are, so
+    // keeping it would walk the hero along a plan the server has already
+    // rejected. Drop it and let the next move request a fresh one.
+    if (resync) this.signals.clearPath();
     const from = resync ?? { col: Math.round(me.x), row: Math.round(me.y) };
 
     const target = nearest.pos!;

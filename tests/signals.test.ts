@@ -300,3 +300,49 @@ describe('kills are counted from the only evidence there is', () => {
     expect(s.drainKills()).toEqual([]);
   });
 });
+
+describe('REGRESSION: s.path was declared and never handled', () => {
+  // SIG.PATH existed with no case in the switch, so the one signal that says
+  // "your move was accepted, here is the wall-aware route" was dropped. The bot
+  // guessed single cardinal steps instead and two of eight wallets stood pinned
+  // at their spawn cell for 30 unbroken minutes, walking into a wall.
+  const ME = 'me';
+
+  it('reads a flat col,row pair array into cells', () => {
+    const s = new SignalState();
+    // Real shape: { seq, fc, fr, cells } with cells a flat number array.
+    s.apply(SIG.PATH, { seq: 1, fc: 5, fr: 5, cells: [5, 5, 6, 5, 7, 5] }, ME);
+    expect(s.path()).toEqual([
+      { col: 5, row: 5 },
+      { col: 6, row: 5 },
+      { col: 7, row: 5 },
+    ]);
+    expect(s.pathFrom).toEqual({ col: 5, row: 5 });
+  });
+
+  it('rejects an odd-length array instead of half-reading it', () => {
+    const s = new SignalState();
+    // An odd tail would shift every later cell by one and send the hero
+    // somewhere the server never routed.
+    s.apply(SIG.PATH, { seq: 1, fc: 0, fr: 0, cells: [1, 1, 2] }, ME);
+    expect(s.path()).toEqual([]);
+  });
+
+  it('treats a stale route as no route', () => {
+    const s = new SignalState();
+    s.apply(SIG.PATH, { seq: 1, fc: 1, fr: 1, cells: [1, 1, 2, 1] }, ME);
+    expect(s.path(5_000)).toHaveLength(2);
+    // A path computed for a position long since left would walk backwards.
+    // `now` is passed explicitly: relying on wall-clock drift between two calls
+    // in the same millisecond is exactly the kind of flake that gets muted later.
+    expect(s.path(1_000, Date.now() + 2_000)).toEqual([]);
+  });
+
+  it('forgets the route when a new run starts', () => {
+    const s = new SignalState();
+    s.apply(SIG.PATH, { seq: 1, fc: 1, fr: 1, cells: [1, 1, 2, 1] }, ME);
+    s.resetRun();
+    // The cells are valid coordinates in a dungeon that no longer exists.
+    expect(s.path()).toEqual([]);
+  });
+});
