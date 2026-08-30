@@ -1254,48 +1254,45 @@ export class AccountRunner {
   /**
    * Inventory items worth listing.
    *
-   * The inventory lives in room state whose schema is runtime-reflected, so
-   * this reads defensively and returns nothing when the shape is unrecognised
-   * rather than inventing item ids. Verify against a live session before
-   * trusting SELL_ENABLED in production.
+   * Reads the parsed `s.inv.sync` inventory, NOT room state. It used to probe
+   * `latestState.inventory ?? latestState.items`, and the live town schema has
+   * neither — its only keys are `players`, `mobs`, `tick` and
+   * `worldRebirthLevel`, confirmed by a state dump. So this returned an empty
+   * list every single time and the marketplace, the bot's one revenue channel,
+   * had nothing to offer even with the token gate open.
    */
   private sellableInventory(): SellableItem[] {
-    const state = this.latestState;
-    if (!state || typeof state !== 'object') return [];
-    const rec = state as Record<string, unknown>;
-    const inv = rec.inventory ?? rec.items;
-    if (!inv || typeof inv !== 'object') return [];
-
-    const out: SellableItem[] = [];
-    for (const [key, v] of Object.entries(inv as Record<string, unknown>)) {
-      if (!v || typeof v !== 'object') continue;
-      const r = v as Record<string, unknown>;
-      const name = typeof r.name === 'string' ? r.name : null;
-      if (!name) continue;
-      const instanceId = typeof r.instanceId === 'string' ? r.instanceId : null;
-      const itemId = typeof r.itemId === 'string' ? r.itemId : key;
-      out.push(
-        instanceId
-          ? { kind: 'instance', instanceId, name, ...optional(r) }
-          : {
-              kind: 'stack',
-              itemId,
-              quantity: typeof r.quantity === 'number' ? r.quantity : 1,
-              name,
-              ...optional(r),
-            },
-      );
-    }
-    return out;
+    return listableItems(this.inventory());
   }
 }
 
-function optional(r: Record<string, unknown>): Partial<SellableItem> {
-  const o: Partial<SellableItem> = {};
-  if (typeof r.category === 'string') o.category = r.category;
-  if (typeof r.slot === 'string') o.slot = r.slot;
-  if (typeof r.rarity === 'string') o.rarity = r.rarity;
-  return o;
+/**
+ * Inventory entries worth listing on the marketplace.
+ *
+ * Pure and exported so the exclusions are testable: this decides what leaves the
+ * hero's bag for good, and the gate being CLOSED on every wallet means the live
+ * path cannot currently exercise it.
+ *
+ * Three exclusions, each load-bearing:
+ *   - equipped gear: listing what the hero is wearing strips it mid-run
+ *   - consumables: the potions are the survival budget, not stock
+ *   - anything without an instance id: `i.inv.equip`/listing needs the handle,
+ *     and stacks in `s.inv.sync` carry only a shared `itemId`
+ */
+export function listableItems(inventory: readonly InventoryItem[]): SellableItem[] {
+  const out: SellableItem[] = [];
+  for (const item of inventory) {
+    if (item.equipped || item.consumable) continue;
+    if (!item.instanceId) continue;
+    out.push({
+      kind: 'instance',
+      instanceId: item.instanceId,
+      name: item.name,
+      ...(item.slot ? { slot: item.slot } : {}),
+      ...(item.rarity ? { rarity: item.rarity } : {}),
+    });
+  }
+  return out;
 }
 
 /**

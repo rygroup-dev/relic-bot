@@ -5,6 +5,8 @@ import {
   chooseCurrency,
   suggestPrice,
 } from '../src/economy/pricing.js';
+import { listableItems } from '../src/fleet/account.js';
+import type { InventoryItem } from '../src/game/actions.js';
 
 const ONE = 1_000_000n; // 1.000000 in micro-units
 
@@ -169,5 +171,44 @@ describe('the gate and the listing floor are recorded, not guessed', () => {
     // The observed legendary "median" is exactly the minimum the game allows,
     // so it reflects the floor rather than what buyers were willing to pay.
     expect(expectedValueMicroUsdc('legendary')).toBe(MIN_LISTING_PRICE.usdc);
+  });
+});
+
+describe('REGRESSION: what actually reaches the marketplace', () => {
+  // sellableInventory() used to read `latestState.inventory ?? latestState.items`.
+  // The live town schema has neither — its only keys are players, mobs, tick and
+  // worldRebirthLevel — so it returned an empty list every time and the bot's one
+  // revenue channel had nothing to list even with the gate open. It now reads the
+  // parsed s.inv.sync inventory through this function.
+  const gear = (over: Partial<InventoryItem> = {}): InventoryItem => ({
+    instanceId: 'inst_1',
+    name: 'Iron Blade',
+    slot: 'weapon',
+    rarity: 'epic',
+    ilvl: 12,
+    consumable: false,
+    ...over,
+  });
+
+  it('lists spare gear', () => {
+    const out = listableItems([gear()]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ kind: 'instance', instanceId: 'inst_1', slot: 'weapon' });
+  });
+
+  it('never lists what the hero is wearing', () => {
+    // Listing worn gear strips the hero mid-run — the opposite of the goal.
+    expect(listableItems([gear({ equipped: true })])).toEqual([]);
+  });
+
+  it('never lists consumables', () => {
+    // The potions are the survival budget, not stock.
+    expect(
+      listableItems([{ itemId: 'pot_hp', name: 'Healing Potion', consumable: true, quantity: 3 }]),
+    ).toEqual([]);
+  });
+
+  it('skips anything with no instance id, because a listing needs the handle', () => {
+    expect(listableItems([{ name: 'Mystery', slot: 'weapon' }])).toEqual([]);
   });
 });
