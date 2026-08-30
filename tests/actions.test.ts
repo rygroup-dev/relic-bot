@@ -17,7 +17,7 @@ import type { SelfView, EntityView } from '../src/game/state.js';
 
 const self = (over: Partial<SelfView> = {}): SelfView => ({
   id: 's', pos: { x: 0, y: 0 }, hp: 100, maxHp: 100, mana: 100, maxMana: 100,
-  level: 5, xp: 0, gold: 0, depth: 1, ...over,
+  level: 5, xp: 0, gold: 0, depth: 1, bonusAttrPoints: 0, raw: {}, ...over,
 });
 
 const potion = (restores: 'hp' | 'mana'): InventoryItem => ({
@@ -117,6 +117,50 @@ describe('equipment upgrades', () => {
 
   it('never tries to equip a consumable', () => {
     expect(equipIntent([{ ...potion('hp'), slot: 'weapon', instanceId: 'x' }])).toBeNull();
+  });
+
+  // ilvl is the server's own power number, on every instance in s.inv.sync.
+  // Ranking on rarity alone called a level-1 epic an upgrade over a level-40
+  // rare — and it went unnoticed because the inventory parser matched nothing,
+  // so this function never ran against live data at all.
+  it('prefers the higher ilvl even when the rarity is lower', () => {
+    const inv: InventoryItem[] = [
+      { instanceId: 'a', name: 'Worn Epic', slot: 'weapon', rarity: 'epic', ilvl: 5, equipped: true },
+      { instanceId: 'b', name: 'Strong Rare', slot: 'weapon', rarity: 'rare', ilvl: 40 },
+    ];
+    expect(equipIntent(inv)?.payload).toEqual({ instanceId: 'b', slot: 'weapon' });
+  });
+
+  it('falls back to rarity when neither item exposes an ilvl', () => {
+    const inv: InventoryItem[] = [
+      { instanceId: 'a', name: 'Rare', slot: 'ring', rarity: 'rare', equipped: true },
+      { instanceId: 'b', name: 'Epic', slot: 'ring', rarity: 'epic' },
+    ];
+    expect(equipIntent(inv)?.payload).toEqual({ instanceId: 'b', slot: 'ring' });
+  });
+
+  it('skips gear above the hero level — the server would refuse it', () => {
+    const inv: InventoryItem[] = [
+      { instanceId: 'b', name: 'Endgame Blade', slot: 'weapon', rarity: 'mythic', ilvl: 90, levelReq: 40 },
+    ];
+    // A refused equip is silent: it would be re-offered every tick forever.
+    expect(equipIntent(inv, self({ level: 5 }))).toBeNull();
+    expect(equipIntent(inv, self({ level: 40 }))).not.toBeNull();
+  });
+
+  it('skips gear restricted to another class', () => {
+    const inv: InventoryItem[] = [
+      { instanceId: 'b', name: 'Mage Staff', slot: 'weapon', rarity: 'epic', ilvl: 20, classId: 'mage' },
+    ];
+    expect(equipIntent(inv, self(), 'knight')).toBeNull();
+    expect(equipIntent(inv, self(), 'mage')).not.toBeNull();
+  });
+
+  it('equips unrestricted gear whatever the class', () => {
+    const inv: InventoryItem[] = [
+      { instanceId: 'b', name: 'Plain Ring', slot: 'ring', rarity: 'rare', ilvl: 10 },
+    ];
+    expect(equipIntent(inv, self(), 'necromancer')).not.toBeNull();
   });
 });
 

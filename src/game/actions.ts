@@ -39,6 +39,18 @@ export interface InventoryItem {
   restores?: 'hp' | 'mana' | null;
   quantity?: number;
   equipped?: boolean;
+  /**
+   * Item level — the server's own power ordering, present on every instance.
+   *
+   * This is strictly better evidence than rarity for "is this an upgrade": a
+   * high-ilvl rare beats a low-ilvl epic, and the equip decision used to rank
+   * on rarity alone because ilvl was never parsed out of `s.inv.sync`.
+   */
+  ilvl?: number;
+  /** Level required to equip. Below it the server refuses the equip. */
+  levelReq?: number;
+  /** Class restriction, when the item has one. */
+  classId?: string;
 }
 
 export interface Ability {
@@ -158,33 +170,63 @@ export function castIntent(
 /**
  * Equip a strictly better item for an empty or weaker slot.
  *
- * Uses the market-calibrated rarity value as the comparison, because that is
- * the only ordering we have evidence for — the client does not expose an
- * item power score.
+ * Ranks on `ilvl` — the server's own power number, present on every instance —
+ * with rarity as the tiebreak. It used to rank on rarity ALONE, which called a
+ * level-1 epic an upgrade over a level-40 rare; ilvl was in the payload the
+ * whole time but `s.inv.sync` was never parsed, so the inventory was always
+ * empty and this function never ran at all.
+ *
+ * Two server-side refusals are respected rather than discovered by being
+ * rejected every tick:
+ *   - `levelReq` above the hero's level
+ *   - `classId` belonging to another class
  */
-export function equipIntent(inventory: readonly InventoryItem[]): ActionIntent | null {
+export function equipIntent(
+  inventory: readonly InventoryItem[],
+  self?: SelfView,
+  classId?: ClassId | null,
+): ActionIntent | null {
   const equippedBySlot = new Map<string, InventoryItem>();
   for (const i of inventory) {
     if (i.equipped && i.slot) equippedBySlot.set(i.slot, i);
   }
 
+  // Power = ilvl when the server gave one, else the market-calibrated rarity
+  // ordering. Scaled so a rarity-only comparison never outranks a real ilvl.
+  const power = (i: InventoryItem | undefined): number => {
+    if (!i) return 0;
+    if (typeof i.ilvl === 'number') return i.ilvl * 100 + lootPriority(i.rarity);
+    return lootPriority(i.rarity);
+  };
+
   let best: { item: InventoryItem; gain: number } | null = null;
   for (const item of inventory) {
     if (item.equipped || item.consumable || !item.slot || !item.instanceId) continue;
-    const current = equippedBySlot.get(item.slot);
-    const mine = lootPriority(item.rarity);
-    const theirs = current ? lootPriority(current.rarity) : 0;
-    const gain = mine - theirs;
+    // The server refuses these; offering them would loop forever at zero errors.
+    if (
+      typeof item.levelReq === 'number' &&
+      self?.level !== null &&
+      self?.level !== undefined &&
+      item.levelReq > self.level
+    ) {
+      continue;
+    }
+    if (item.classId && classId && item.classId !== classId) continue;
+
+    const gain = power(item) - power(equippedBySlot.get(item.slot));
     if (gain <= 0) continue;
     if (!best || gain > best.gain) best = { item, gain };
   }
   if (!best) return null;
 
+  const current = best.item.slot ? equippedBySlot.get(best.item.slot) : undefined;
   return {
     type: MSG.INV_EQUIP,
     payload: { instanceId: best.item.instanceId, slot: best.item.slot },
     label: `equip ${best.item.name}`,
-    reason: `${best.item.rarity ?? 'unknown'} upgrade for the ${best.item.slot} slot`,
+    reason:
+      `ilvl ${best.item.ilvl ?? '?'} ${best.item.rarity ?? 'unknown'} for the ` +
+      `${best.item.slot} slot, replacing ilvl ${current?.ilvl ?? 'nothing'}`,
     priority: 0.6,
   };
 }
@@ -271,7 +313,7 @@ export function characterIntents(
     healingIntent(self, inventory, tuning),
     chestIntent(entities),
     castIntent(self, opts.abilities ?? [], opts.targetId ?? null),
-    equipIntent(inventory),
+    equipIntent(inventory, self, opts.classId ?? null),
     manaIntent(self, inventory, tuning),
     attributeIntent(opts.classId ?? null, opts.unspentPoints ?? 0),
   ];
