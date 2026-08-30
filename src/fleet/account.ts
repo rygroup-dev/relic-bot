@@ -122,6 +122,15 @@ export class AccountRunner {
   private floorCleared = false;
   /** Set by `d.fountain.state` when a healing fountain is available. */
   private fountainReady = false;
+  /**
+   * One-shot per session: ask the town merchant what it stocks.
+   *
+   * `i.shop.stock` has never been sent by this bot and `s.shop.stock` has never
+   * been observed, so the payload shape is unknown. Probing logs it once rather
+   * than guessing at a schema — the same mistake that left the inventory parser
+   * matching nothing for the bot's entire life.
+   */
+  private shopProbed = false;
   /** Cell the fountain must be used from, from the same payload. */
   private fountainAt: Cell | null = null;
   /** Set by `d.resurrection.state`. */
@@ -449,6 +458,9 @@ export class AccountRunner {
 
       // Between runs: sell what the last one produced, then go again.
       await this.sellCycle();
+      // Ask the merchant what it sells, once. Read-only and gold-denominated;
+      // nothing is bought until the reply proves what the payload looks like.
+      this.probeShop(zone);
       this.note = `between runs (${runs} completed)`;
 
       // A short breather so a failed entry does not become a hot loop.
@@ -457,6 +469,37 @@ export class AccountRunner {
 
     await zone.leave(true);
     this.zone = null;
+  }
+
+  /**
+   * Ask the town merchant for its stock, once per session.
+   *
+   * Read-only: `i.shop.stock` requests a list, it does not buy. The reply lands
+   * on `s.shop.stock`, where `observe()` logs its shape.
+   *
+   * This exists because buying potions is the obvious next lever for survival —
+   * the hero dies at 1 potion per run — and the shop is gold-denominated over
+   * the WebSocket, so it needs no Solana signature and does not touch the
+   * payment hard-lock in `endpoints.ts`. But `i.shop.buy` wants
+   * `{ merchantId, itemId, quantity }` and NONE of those three values are known:
+   * no merchant id has ever been observed, and no item id for a potion either.
+   *
+   * Guessing them is exactly the failure this codebase keeps repeating — a wrong
+   * field name is ignored in silence, so the bot would loop "buying" nothing at
+   * zero errors, which is how the inventory parser stayed broken for the bot's
+   * entire life. So this probes and logs, and buying stays unimplemented until
+   * the real payload is in hand.
+   */
+  private probeShop(zone: ZoneConnection): void {
+    if (this.shopProbed || !zone.connected) return;
+    this.shopProbed = true;
+    try {
+      zone.send(MSG.SHOP_STOCK, {});
+      this.log.debug('sent i.shop.stock — waiting to see what s.shop.stock looks like');
+    } catch (err) {
+      // A refused probe must never end a session: it buys nothing either way.
+      this.log.debug(`i.shop.stock refused: ${(err as Error).message}`);
+    }
   }
 
   /**
