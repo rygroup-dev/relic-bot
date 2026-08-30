@@ -42,6 +42,19 @@ export interface SelfView {
   gold: number | null;
   /** Current dungeon depth, when inside a run. */
   depth: number | null;
+  /** Unallocated attribute points. Server field is `bonusAttrPoints`. */
+  bonusAttrPoints: number | null;
+  /**
+   * The raw player record.
+   *
+   * Needed because the schema carries far more than this view names — six
+   * shield pools, per-attribute allocations, `dead`/`ghost`/corpse position —
+   * and callers that want one of those should read the record rather than have
+   * every field mirrored here. `abilities()` in particular read `self.raw` when
+   * this field did not exist, so it always saw `undefined` and offered no
+   * abilities at all.
+   */
+  raw: unknown;
 }
 
 function num(v: unknown): number | null {
@@ -142,14 +155,21 @@ export function readSelf(state: unknown, sessionId: string | null): SelfView {
     xp: null,
     gold: null,
     depth: null,
+    bonusAttrPoints: null,
+    raw: null,
   };
   if (!state || typeof state !== 'object' || !sessionId) return empty;
 
   for (const [, collection] of Object.entries(state as Record<string, unknown>)) {
     for (const [k, v] of iterCollection(collection)) {
       if (k !== sessionId) continue;
-      // Field names verified against the client's own reads in the bundle:
-      // hp, maxHp, mana, maxMana, level, xp, gold, depth.
+      // Field names verified against a live dungeon state dump 2026-08-30:
+      // col/row (NOT x/y), hp, maxHp, mana, maxMana, level, xp, gold,
+      // bonusAttrPoints, dead, ghost, corpseCol, corpseRow.
+      //
+      // `depth` is NOT on the player record. It was probed here and always came
+      // back null, so the status view reported an unknown depth for every run.
+      // Run depth lives on the run summary (`d.summary.depthReached`).
       return {
         id: sessionId,
         pos: readPos(v),
@@ -161,6 +181,11 @@ export function readSelf(state: unknown, sessionId: string | null): SelfView {
         xp: num(pick(v, ['xp', 'experience'])),
         gold: num(pick(v, ['gold', 'coins'])),
         depth: num(pick(v, ['depth', 'runDepth'])),
+        // The server calls it `bonusAttrPoints`. `unspentPoints` was the only
+        // name read anywhere and it does not exist, so attribute points were
+        // never spent — a knight ran every dungeon at base vitality.
+        bonusAttrPoints: num(pick(v, ['bonusAttrPoints', 'unspentPoints', 'attrPoints'])),
+        raw: v,
       };
     }
   }
