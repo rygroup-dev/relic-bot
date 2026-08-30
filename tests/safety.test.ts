@@ -41,6 +41,28 @@ describe('refusal classification (a benign-looking refusal must still block)', (
     expect(v.cooldownMs).toBe(Infinity);
     expect(v.needsOperator).toBe(true);
   });
+
+  it('backs off on high_demand instead of retrying into the throttle', () => {
+    // Observed live 2026-08-30: 8913 denials in 6h, a flat ~3000/h for 24h.
+    // high_demand fell through to the 'unknown' retry verdict, so no park was
+    // ever written and every wallet re-walked to the trapdoor 5s later — the
+    // fleet manufactured the demand it was refused for. 15 of 20 wallets sat
+    // at zero production for 22-37h with zero errors.
+    const v = classifyRefusal(new Error('dungeon_denied_high_demand'));
+    expect(v.kind).toBe('high_demand');
+    // Must be an account park: 'retry' writes no park at all, which is the bug.
+    expect(v.scope).toBe('account');
+    expect(v.cooldownMs).toBeGreaterThanOrEqual(60_000);
+    // Recoverable on its own — a capacity throttle needs no human.
+    expect(v.needsOperator).toBe(false);
+  });
+
+  it('jitters the high_demand backoff so the fleet does not stampede as one', () => {
+    const seen = new Set<number>();
+    for (let i = 0; i < 40; i += 1) seen.add(classifyRefusal('high_demand').cooldownMs);
+    // A fixed cooldown only moves the synchronised retry burst later.
+    expect(seen.size).toBeGreaterThan(1);
+  });
 });
 
 describe('SLCW REGRESSION: free() is the only way to run value work', () => {

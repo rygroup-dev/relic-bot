@@ -194,6 +194,7 @@ export type RefusalKind =
   | 'device_busy'
   | 'rate_limited'
   | 'no_character'
+  | 'high_demand'
   | 'unknown';
 
 /** How the orchestrator must respond to a refusal. */
@@ -232,6 +233,21 @@ export function classifyRefusal(raw: unknown): RefusalVerdict {
     // one is a permanent, named choice that belongs to the operator. Park the
     // account and say so, rather than reconnecting forever at zero errors.
     return { kind: 'no_character', scope: 'account', cooldownMs: Infinity, needsOperator: true };
+  }
+  if (/high_demand/.test(s)) {
+    // Server-side dungeon capacity throttle. Observed live 2026-08-30: 8913
+    // denials in 6h at ~3000/h, because a denial fell through to the 'unknown'
+    // retry verdict and every wallet re-walked to the trapdoor 5s later. The
+    // fleet was generating the demand it was being refused for.
+    //
+    // Randomised so wallets do not all come back on the same beat — a fixed
+    // cooldown just moves the synchronised stampede 60s later.
+    return {
+      kind: 'high_demand',
+      scope: 'account',
+      cooldownMs: 60_000 + Math.floor(Math.random() * 90_000),
+      needsOperator: false,
+    };
   }
   return { kind: 'unknown', scope: 'retry', cooldownMs: 15_000, needsOperator: false };
 }
