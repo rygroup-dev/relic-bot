@@ -129,6 +129,31 @@ export class AccountRunner {
   private lastLevel: number | null = null;
   /** Gate state at the previous check, to notice it opening. */
   private lastGateAllowed: boolean | null = null;
+  /**
+   * Display name of the mob most recently attacked.
+   *
+   * The server sends no "X killed you" payload, so this is the only evidence
+   * available for attributing a death. Without it every death went unrecorded
+   * and `winRate()` returned a perfect 1.0 for every monster in the game.
+   */
+  private lastTargetName: string | null = null;
+  /**
+   * Distinct dungeon message types seen this run, logged once each at debug.
+   *
+   * Added because `inventory sync` appeared ZERO times in the entire journal:
+   * either `s.inv.sync` never arrives or its payload shape differs from the
+   * three keys probed. Without the inventory every potion, equip and sell
+   * decision is dead code, so the actual vocabulary has to be observed rather
+   * than assumed.
+   */
+  private seenTypes = new Set<string>();
+  /**
+   * Last readable-state verdict, so a flip is logged instead of every tick.
+   *
+   * `null` means "not yet decided", which is distinct from `false` — the first
+   * verdict of a run must always be logged, whatever it is.
+   */
+  private lastReadable: boolean | null = null;
 
   /**
    * Every message from the dungeon room.
@@ -138,6 +163,15 @@ export class AccountRunner {
    */
   private onDungeonSignal(type: string, payload: unknown): void {
     this.signals.apply(type, payload, this.dungeonSessionId);
+
+    // Observe the real vocabulary once per type. `s.inv.sync` has never once
+    // been logged as received, and an unread inventory silently disables
+    // potions, equipping and selling — so the shape gets dumped rather than
+    // assumed. Debug-level: this is diagnosis, not routine output.
+    if (!this.seenTypes.has(type)) {
+      this.seenTypes.add(type);
+      this.log.debug(`first ${type}: ${safeShape(payload)}`);
+    }
 
     // A mythic or legendary drop is worth telling someone about; commons are
     // constant noise and must never reach the chat.
@@ -182,6 +216,22 @@ export class AccountRunner {
     if (type === SIG.DEATH) {
       if (this.signals.dead) {
         this.note = 'died in the dungeon';
+        // Record the loss. `record()` accepts 'win' | 'loss' but 'loss' was
+        // never once passed anywhere in src/, so every wallet reported
+        // wins === battles and winRate() returned a flat 1.0. That fed
+        // combatCandidates(), whose loseAversion term is therefore inert: the
+        // bot re-picked the monster that had just killed it, every run.
+        // Evidence for the misread: 328 run summaries, all reason="wiped",
+        // all depthReached=1, against zero recorded losses.
+        //
+        // The server sends no killer id, so the mob we were last attacking is
+        // the only attribution available. Named 'unknown' when there is none,
+        // matching how kills are recorded.
+        this.d.combat.record(this.account.id, this.lastTargetName ?? 'unknown', 'loss');
+        // Deliberately NOT written to the value ledger: `lastValueAt()` is the
+        // watchdog's only liveness signal, so logging a death there would make
+        // dying look like production and silence the one alarm that works.
+        this.lastTargetName = null;
       } else {
         // A death that is not ours is a kill — the only kill evidence there is.
         // The death payload carries an id but not always a name, so resolve it
@@ -409,6 +459,21 @@ export class AccountRunner {
   private async runDungeon(): Promise<void> {
     if (!this.session) return;
 
+    // Check the park BEFORE walking. free() below would refuse a parked entry
+    // anyway, but the walk is 19 server-acked moves and it happens first, so a
+    // parked wallet would still cross town every 5s to be turned away at the
+    // door. Observed live 2026-08-30 as the movement half of the high_demand
+    // storm.
+    const parked = this.d.parks.blocking(this.account.id, 'dungeon');
+    if (parked) {
+      const waitMs = Number.isFinite(parked.until)
+        ? Math.max(5_000, parked.until - Date.now())
+        : 60_000;
+      this.note = `waiting out ${parked.key} park: ${parked.reason.slice(0, 60)}`;
+      await sleep(Math.min(waitMs, 180_000));
+      return;
+    }
+
     // Entry is refused with `too_far` unless the hero is on the trapdoor, so
     // walk there first rather than requesting from the spawn point.
     const at = await this.walkToDungeonEntrance();
@@ -446,6 +511,9 @@ export class AccountRunner {
       const { room, client } = entry;
       this.note = 'in dungeon';
       this.signals.resetRun();
+      this.lastTargetName = null;
+      this.seenTypes.clear();
+      this.lastReadable = null;
       let finished = false;
 
       this.dungeonSessionId = room.sessionId;
@@ -632,6 +700,11 @@ export class AccountRunner {
       const chosen: ActionIntent | undefined = intents[Number.isFinite(idx) ? idx : 0];
       if (!chosen) return false;
       this.note = chosen.label;
+      // Logged because these are the actions that make a hero stronger, and
+      // until 2026-08-30 not one of them had ever fired: the inventory parser
+      // matched nothing, so potions, equips and attribute spends were all
+      // silently unreachable. An empty log here is the alarm.
+      this.log.info(`upkeep: ${chosen.label} (${chosen.reason})`);
       send(chosen.type, chosen.payload);
       return true;
     });
@@ -705,6 +778,9 @@ export class AccountRunner {
       if (e.quantity !== undefined) item.quantity = e.quantity;
       if (e.equipped !== undefined) item.equipped = e.equipped;
       if (e.consumable !== undefined) item.consumable = e.consumable;
+      if (e.ilvl !== undefined) item.ilvl = e.ilvl;
+      if (e.levelReq !== undefined) item.levelReq = e.levelReq;
+      if (e.classId !== undefined) item.classId = e.classId;
       // The server does not label what a potion restores, so infer from the
       // name rather than inventing a field that is not there.
       if (item.consumable) {
@@ -718,10 +794,26 @@ export class AccountRunner {
     });
   }
 
-  /** Abilities exposed on the player record, if any. */
+  /**
+   * Abilities exposed on the player record, if any.
+   *
+   * KNOWN GAP, stated rather than guessed: the live dungeon player schema
+   * (dumped 2026-08-30) carries NO abilities or spells array. Its 44 fields are
+   * position, six shield pools, hp/mana, level/xp/gold/pxp, kills/deaths, the
+   * five alloc* attributes, bonusAttrPoints, and dead/ghost/corpse state.
+   *
+   * So this returns [] on the live server and `castIntent()` is never offered —
+   * the bot attacks with `i.attack` only. The loadout is likely delivered by
+   * `s.loadout.locked`, which is in SIG but not yet captured. Reading the
+   * dungeon record rather than town's is still correct: when the source is
+   * found this is where it will surface.
+   */
   private abilities(): { abilityId: string; name?: string; manaCost?: number; readyAt?: number }[] {
-    const self = readSelf(this.latestState, this.zone?.sessionId ?? null);
-    const raw = (self as unknown as { raw?: Record<string, unknown> }).raw;
+    const self = readSelf(
+      this.dungeonState ?? this.latestState,
+      this.dungeonSessionId ?? this.zone?.sessionId ?? null,
+    );
+    const raw = self.raw as Record<string, unknown> | null;
     const list = raw?.abilities ?? raw?.spells;
     if (!Array.isArray(list)) return [];
     return list
@@ -741,19 +833,46 @@ export class AccountRunner {
       .filter((a) => a.abilityId.length > 0);
   }
 
+  /**
+   * Unallocated attribute points.
+   *
+   * Two bugs lived here, both silent. The field is `bonusAttrPoints`, not
+   * `unspentPoints` — the latter appears nowhere in the schema, so this always
+   * returned 0 and `attributeIntent()` was never once offered. And it read
+   * `latestState` (town) with the town session id while the caller is inside a
+   * dungeon, where both differ. Verified against a live dungeon state dump
+   * 2026-08-30.
+   */
   private unspentPoints(): number {
-    const state = this.latestState;
-    if (!state || typeof state !== 'object') return 0;
-    const players = (state as Record<string, unknown>).players;
-    const me = players && typeof players === 'object'
-      ? (players as Record<string, unknown>)[this.zone?.sessionId ?? '']
-      : null;
-    const n = (me as Record<string, unknown> | null)?.unspentPoints;
-    return typeof n === 'number' && n > 0 ? Math.floor(n) : 0;
+    const self = readSelf(
+      this.dungeonState ?? this.latestState,
+      this.dungeonSessionId ?? this.zone?.sessionId ?? null,
+    );
+    return self.bonusAttrPoints !== null && self.bonusAttrPoints > 0
+      ? Math.floor(self.bonusAttrPoints)
+      : 0;
   }
 
   /** One decision inside a dungeon, where the mobs actually are. */
   private async dungeonTick(
+    room: { send: (t: string, p?: unknown) => void },
+    sessionId: string | null,
+  ): Promise<void> {
+    // `note` is the only record of what a tick decided, and it was written to a
+    // status field that never reaches the log — so "is the bot attacking?" was
+    // unanswerable from the journal, and counting `attacking` in it proved
+    // nothing either way. Log the note whenever it CHANGES: every branch below
+    // already sets one, so this covers the whole decision surface at a few
+    // lines per run rather than one per tick.
+    const before = this.note;
+    try {
+      await this.decideInDungeon(room, sessionId);
+    } finally {
+      if (this.note !== before) this.log.info(`tick: ${this.note}`);
+    }
+  }
+
+  private async decideInDungeon(
     room: { send: (t: string, p?: unknown) => void },
     sessionId: string | null,
   ): Promise<void> {
@@ -776,6 +895,32 @@ export class AccountRunner {
     // The dungeon room has its own session id AND its own state. Reading the
     // shared field gave town's view; reading with a null id gave nothing.
     const self = readSelf(this.dungeonState, sessionId);
+
+    // Why a tick did nothing, once per run. Added because a fleet can sit in a
+    // dungeon producing no attacks and no upkeep at all, with zero errors — the
+    // exact failure mode the watchdog exists for, and unreadable without this.
+    //
+    // Re-logged whenever the readable-state verdict FLIPS, not just on tick 0:
+    // the first tick fires before Colyseus has delivered the opening state, so a
+    // tick-0-only dump always reads "entities=0" and says nothing about whether
+    // the bot ever recovered.
+    const mobCount = entities.filter((e) => e.kind === 'monster').length;
+    const readable = self.pos !== null && mobCount > 0;
+    if (this.lastReadable !== readable) {
+      this.lastReadable = readable;
+      this.log.info(
+        `state ${readable ? 'READABLE' : 'BLIND'}: ` +
+          `self=(${self.pos ? `${self.pos.x},${self.pos.y}` : '?'}) ` +
+          `hp=${self.hp ?? '?'}/${self.maxHp ?? '?'} lvl=${self.level ?? '?'} ` +
+          `attrPts=${self.bonusAttrPoints ?? '?'} entities=${entities.length} ` +
+          `mobs=${mobCount} bag=${this.inventory().length} ` +
+          `sid=${sessionId ?? 'null'} stateKeys=${
+            this.dungeonState && typeof this.dungeonState === 'object'
+              ? Object.keys(this.dungeonState as object).join('|')
+              : 'none'
+          }`,
+      );
+    }
 
     // An incoming attack telegraph is the one moment where moving beats
     // attacking. Roll first, ask questions after.
@@ -811,7 +956,25 @@ export class AccountRunner {
 
       // Nothing to drink: back away from the nearest threat instead of trading
       // hits we cannot win.
-      const threat = entities.find((e) => e.kind === 'monster' && e.pos);
+      //
+      // Must be the NEAREST threat, not the first in iteration order. `find()`
+      // returned whatever the schema happened to list first — with 56 mobs on a
+      // floor that is effectively arbitrary, so the retreat vector was computed
+      // against a mob across the room and could step the hero straight into the
+      // one actually hitting it.
+      const threats = entities.filter(
+        (e) => e.kind === 'monster' && e.pos && (e.hp === null || e.hp > 0),
+      );
+      const me = self.pos;
+      const threat =
+        me && threats.length > 0
+          ? threats.reduce((a, b) =>
+              Math.hypot(b.pos!.x - me.x, b.pos!.y - me.y) <
+              Math.hypot(a.pos!.x - me.x, a.pos!.y - me.y)
+                ? b
+                : a,
+            )
+          : null;
       if (threat?.pos && self.pos) {
         const dx = Math.sign(self.pos.x - threat.pos.x) || 1;
         const dy = Math.sign(self.pos.y - threat.pos.y) || 1;
@@ -884,6 +1047,9 @@ export class AccountRunner {
       return;
     }
     this.note = `attacking ${parsed.target} (${d.source})`;
+    // Remembered so a death can be attributed to the mob that caused it — the
+    // server sends no killer id, and without this every loss lands on 'unknown'.
+    this.lastTargetName = this.mobName(parsed.target);
     room.send(MSG.ATTACK, {
       targetId: parsed.target,
       fromCol: self.pos ? Math.round(self.pos.x) : undefined,
@@ -1051,4 +1217,35 @@ function safeLabel(payload: unknown): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Top-level shape of a payload: keys and value types, never values.
+ *
+ * Used to learn a message's real shape without risking a secret reaching the
+ * log — the redactor covers known patterns, but "log only the type names" is a
+ * stronger guarantee than "match every secret format".
+ */
+function safeShape(payload: unknown): string {
+  if (payload === null || payload === undefined) return String(payload);
+  if (typeof payload !== 'object') return typeof payload;
+  if (Array.isArray(payload)) {
+    return `array[${payload.length}]${
+      payload.length > 0 ? ` of ${safeShape(payload[0])}` : ''
+    }`;
+  }
+  const r = payload as Record<string, unknown>;
+  const parts = Object.keys(r)
+    .slice(0, 24)
+    .map((k) => {
+      const v = r[k];
+      // Recurse one level into arrays: the interesting shapes (inventory
+      // instances and stacks) are the ELEMENTS, and `array[2]` alone was not
+      // enough to write a parser against.
+      if (Array.isArray(v)) {
+        return `${k}:array[${v.length}]${v.length > 0 ? `of${safeShape(v[0])}` : ''}`;
+      }
+      return `${k}:${v === null ? 'null' : typeof v}`;
+    });
+  return `{ ${parts.join(', ')} }`;
 }

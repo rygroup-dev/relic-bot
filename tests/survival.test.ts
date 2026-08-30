@@ -14,7 +14,7 @@ import type { SelfView, EntityView } from '../src/game/state.js';
 
 const self = (hp: number, maxHp = 100): SelfView => ({
   id: 's', pos: { x: 0, y: 0 }, hp, maxHp, mana: 50, maxMana: 100,
-  level: 1, xp: 0, gold: 0, depth: 1,
+  level: 1, xp: 0, gold: 0, depth: 1, bonusAttrPoints: 0, raw: {},
 });
 
 const mob = (id: string, x = 1): EntityView => ({
@@ -91,5 +91,67 @@ describe('REGRESSION: the hero must be able to see itself', () => {
     expect(blind.hp).toBeNull();
     expect(blind.maxHp).toBeNull();
     expect(tooHurtToFight(blind, DEFAULT_COMBAT_TUNING)).toBe(false);
+  });
+
+  it('reads bonusAttrPoints, the name the server actually sends', async () => {
+    const { readSelf } = await import('../src/game/state.js');
+    // Live dungeon schema dump 2026-08-30 names it `bonusAttrPoints`. The only
+    // reader in src/ looked for `unspentPoints`, which is in no schema, so it
+    // always saw 0 and attributeIntent() was never offered once — every hero
+    // fought at base vitality for its whole life.
+    const state = { players: { abc: { col: 1, row: 2, hp: 70, maxHp: 70, bonusAttrPoints: 5 } } };
+    expect(readSelf(state, 'abc').bonusAttrPoints).toBe(5);
+    expect(readSelf({ players: { abc: { col: 1, row: 2, hp: 1 } } }, 'abc').bonusAttrPoints)
+      .toBeNull();
+  });
+
+  it('exposes the raw player record so callers can read unnamed fields', async () => {
+    const { readSelf } = await import('../src/game/state.js');
+    // `abilities()` read `self.raw` while SelfView had no such field, so it was
+    // always undefined — a silent always-empty result, not a type error.
+    const player = { col: 1, row: 2, hp: 70, maxHp: 70, boneShield: 12 };
+    expect(readSelf({ players: { abc: player } }, 'abc').raw).toEqual(player);
+  });
+});
+
+describe('REGRESSION: a death must be recorded as a loss', () => {
+  it('winRate drops below 1.0 once a loss is recorded', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'relic-loss-'));
+    try {
+      const memory = new CombatMemory(dir);
+      memory.record('w1', 'Ghoul', 'win');
+      memory.record('w1', 'Ghoul', 'win');
+      expect(memory.winRate('w1', 'Ghoul')).toBe(1);
+
+      // Live evidence 2026-08-30: 328 run summaries, every one reason="wiped"
+      // at depthReached=1, against losses:0 on every wallet — because 'loss'
+      // was never passed anywhere in src/. A permanent 1.0 win rate makes the
+      // loseAversion term in combatCandidates() inert, so the bot re-picks
+      // whatever just killed it.
+      memory.record('w1', 'Ghoul', 'loss');
+      const wr = memory.winRate('w1', 'Ghoul');
+      expect(wr).not.toBeNull();
+      expect(wr!).toBeLessThan(1);
+      expect(memory.forAccount('w1').Ghoul.losses).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('down-weights a monster that has beaten us', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'relic-loss2-'));
+    try {
+      const naive = new CombatMemory(dir);
+      const [fresh] = combatCandidates(self(100), [mob('m1')], naive, 'w1');
+
+      const beaten = new CombatMemory(mkdtempSync(join(tmpdir(), 'relic-loss3-')));
+      for (let i = 0; i < 4; i += 1) beaten.record('w1', 'Ghoul', 'loss');
+      const [avoided] = combatCandidates(self(100), [mob('m1')], beaten, 'w1');
+
+      // This is the whole point of recording losses: the score must move.
+      expect(avoided!.score).toBeLessThan(fresh!.score);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
