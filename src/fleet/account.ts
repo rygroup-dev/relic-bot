@@ -510,6 +510,7 @@ export class AccountRunner {
 
       const { room, client } = entry;
       this.note = 'in dungeon';
+      const joinedAt = Date.now();
       this.signals.resetRun();
       this.lastTargetName = null;
       this.seenTypes.clear();
@@ -534,6 +535,7 @@ export class AccountRunner {
         });
       }
       room.onMessage(DUNGEON_IN.EXIT, () => {
+        this.log.info('run ended: d.exit');
         finished = true;
       });
       room.onMessage(DUNGEON_IN.SUMMARY, (p: unknown) => {
@@ -550,7 +552,13 @@ export class AccountRunner {
           this.log.debug(`dungeon state shape:\n${describeUnknownState(st, 3, 40)}`);
         }
       });
-      room.onLeave(() => {
+      // Why the room closed. Runs were observed ending ~2s after joining with no
+      // d.exit and no d.summary, which means this fired — but it logged nothing,
+      // so a 2-second run was indistinguishable from a completed one. The code
+      // is the whole diagnosis: 1000 is a normal close, 4xxx is a server refusal.
+      room.onLeave((code: number) => {
+        const alive = Math.round((Date.now() - joinedAt) / 100) / 10;
+        this.log.warn(`run ended: room closed (code ${code}) after ${alive}s`);
         finished = true;
       });
 
@@ -727,6 +735,18 @@ export class AccountRunner {
    * guessing at walls. The server refuses illegal moves and reports where we
    * really are via `s.move.denied`, which is better truth than a map we do
    * not have.
+   *
+   * ONE AXIS PER STEP. This sent `{ col: col+dx, row: row+dy }` with both
+   * deltas non-zero — a diagonal — and the server refused every single one:
+   * 14 `s.move.denied` against 0 `s.path` in a 10-minute window, with the hero
+   * pinned at its spawn cell and the resync echoing that same cell back. The
+   * town pathfinder in `world.ts` only ever emits cardinal neighbours
+   * ([1,0] [-1,0] [0,1] [0,-1]) and walking to the trapdoor always worked, so
+   * cardinal-only is the movement rule the server enforces.
+   *
+   * Consequence of the diagonal: distance stuck at 12 cells against a
+   * `maxEngageDistance` of 12, so `combatCandidates()` was always empty and the
+   * bot never attacked once — in a room with 66 mobs.
    */
   private approachNearestMob(
     room: { send: (t: string, p?: unknown) => void },
@@ -749,15 +769,27 @@ export class AccountRunner {
     const from = resync ?? { col: Math.round(me.x), row: Math.round(me.y) };
 
     const target = nearest.pos!;
-    const dx = Math.sign(target.x - from.col);
-    const dy = Math.sign(target.y - from.row);
-    if (dx === 0 && dy === 0) return false;
+    const dCol = target.x - from.col;
+    const dRow = target.y - from.row;
+    if (dCol === 0 && dRow === 0) return false;
+
+    // Close the longer axis first: it is the one that dominates the remaining
+    // distance, and a single cardinal step is what the server accepts.
+    const step =
+      Math.abs(dCol) >= Math.abs(dRow)
+        ? { col: from.col + Math.sign(dCol), row: from.row }
+        : { col: from.col, row: from.row + Math.sign(dRow) };
 
     // One step per tick keeps pace with the server's own movement rate.
-    room.send(MSG.MOVE, { col: from.col + dx, row: from.row + dy, seq: ++this.moveSeq });
+    room.send(MSG.MOVE, { col: step.col, row: step.row, seq: ++this.moveSeq });
+    // Position is part of the note on purpose. The note is only logged when it
+    // CHANGES, so including the origin cell makes a stalled approach visible: a
+    // bot that is actually closing distance logs a new line each step, while one
+    // that is refused every tick logs exactly once and then goes quiet.
     this.note =
-      `approaching ${nearest.name} — ` +
-      `${Math.round(Math.hypot(target.x - from.col, target.y - from.row))} cells away`;
+      `approaching ${nearest.name} (${from.col},${from.row})->(${step.col},${step.row})` +
+      `${resync ? ' [resynced]' : ''} — ` +
+      `${Math.round(Math.hypot(dCol, dRow))} cells away`;
     return true;
   }
 
