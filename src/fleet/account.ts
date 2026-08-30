@@ -122,8 +122,12 @@ export class AccountRunner {
   private floorCleared = false;
   /** Set by `d.fountain.state` when a healing fountain is available. */
   private fountainReady = false;
+  /** Cell the fountain must be used from, from the same payload. */
+  private fountainAt: Cell | null = null;
   /** Set by `d.resurrection.state`. */
   private resurrectionReady = false;
+  /** Cell the resurrection shrine must be used from. */
+  private resurrectionAt: Cell | null = null;
   private descendSentAt = 0;
   /** Last level seen, so a level-up is detected rather than polled. */
   private lastLevel: number | null = null;
@@ -199,8 +203,13 @@ export class AccountRunner {
       this.note = 'floor cleared';
     } else if (type === DUNGEON_IN.FOUNTAIN_STATE) {
       this.fountainReady = readyFlag(payload);
+      // The payload carries the cell the prop must be used from. Without it the
+      // bot sent i.dungeon.fountain.use from wherever it stood; the server
+      // refuses that silently, so a critical-HP tick was spent on nothing.
+      this.fountainAt = readInteractionCell(payload);
     } else if (type === DUNGEON_IN.RESURRECTION_STATE) {
       this.resurrectionReady = readyFlag(payload);
+      this.resurrectionAt = readInteractionCell(payload);
     } else if (type === DUNGEON_IN.DESCEND) {
       // A successful descend resets the floor: new mobs, new exit.
       this.floorCleared = false;
@@ -522,7 +531,9 @@ export class AccountRunner {
       this.dungeonState = null;
       this.floorCleared = false;
       this.fountainReady = false;
+      this.fountainAt = null;
       this.resurrectionReady = false;
+      this.resurrectionAt = null;
       this.descendSentAt = 0;
 
       for (const type of VALUE_SIGNALS) {
@@ -728,6 +739,31 @@ export class AccountRunner {
   }
 
   /**
+   * Send one cardinal step from `here` toward `to`. Returns false when already
+   * there.
+   *
+   * Cardinal-only, and the reason is load-bearing: a diagonal `i.move` is
+   * refused by the server every time, which is what pinned the hero at its
+   * spawn cell and stopped it ever attacking. Shared by mob approach and prop
+   * approach so the rule cannot be re-broken in one of them.
+   */
+  private stepToward(
+    room: { send: (t: string, p?: unknown) => void },
+    here: Cell,
+    to: Cell,
+  ): boolean {
+    const dCol = to.col - here.col;
+    const dRow = to.row - here.row;
+    if (dCol === 0 && dRow === 0) return false;
+    const step =
+      Math.abs(dCol) >= Math.abs(dRow)
+        ? { col: here.col + Math.sign(dCol), row: here.row }
+        : { col: here.col, row: here.row + Math.sign(dRow) };
+    room.send(MSG.MOVE, { col: step.col, row: step.row, seq: ++this.moveSeq });
+    return true;
+  }
+
+  /**
    * Step toward the nearest living mob.
    *
    * Moves in a straight line rather than pathfinding: the dungeon is
@@ -771,23 +807,15 @@ export class AccountRunner {
     const target = nearest.pos!;
     const dCol = target.x - from.col;
     const dRow = target.y - from.row;
-    if (dCol === 0 && dRow === 0) return false;
-
-    // Close the longer axis first: it is the one that dominates the remaining
-    // distance, and a single cardinal step is what the server accepts.
-    const step =
-      Math.abs(dCol) >= Math.abs(dRow)
-        ? { col: from.col + Math.sign(dCol), row: from.row }
-        : { col: from.col, row: from.row + Math.sign(dRow) };
-
-    // One step per tick keeps pace with the server's own movement rate.
-    room.send(MSG.MOVE, { col: step.col, row: step.row, seq: ++this.moveSeq });
+    if (!this.stepToward(room, from, { col: Math.round(target.x), row: Math.round(target.y) })) {
+      return false;
+    }
     // Position is part of the note on purpose. The note is only logged when it
     // CHANGES, so including the origin cell makes a stalled approach visible: a
     // bot that is actually closing distance logs a new line each step, while one
     // that is refused every tick logs exactly once and then goes quiet.
     this.note =
-      `approaching ${nearest.name} (${from.col},${from.row})->(${step.col},${step.row})` +
+      `approaching ${nearest.name} from (${from.col},${from.row})` +
       `${resync ? ' [resynced]' : ''} — ` +
       `${Math.round(Math.hypot(dCol, dRow))} cells away`;
     return true;
@@ -913,10 +941,20 @@ export class AccountRunner {
     // still has loot in it.
     if (this.signals.dead) {
       if (this.resurrectionReady) {
-        this.note = 'dead — using the resurrection';
-        room.send(MSG.DUNGEON_RESURRECTION_USE, {});
-        this.resurrectionReady = false;
-        return;
+        // Same interaction-cell rule as the fountain: a shrine used from the
+        // wrong cell is refused in silence. A dead hero cannot walk, so this is
+        // attempted only when already in reach, and revive is the fallback.
+        const at = this.resurrectionAt;
+        const self = readSelf(this.dungeonState, sessionId);
+        const here = self.pos ? { col: Math.round(self.pos.x), row: Math.round(self.pos.y) } : null;
+        const inReach =
+          !at || (here && Math.abs(at.col - here.col) <= 1 && Math.abs(at.row - here.row) <= 1);
+        if (inReach) {
+          this.note = 'dead — using the resurrection';
+          room.send(MSG.DUNGEON_RESURRECTION_USE, {});
+          this.resurrectionReady = false;
+          return;
+        }
       }
       this.note = 'dead — attempting revive';
       room.send(MSG.REVIVE, {});
@@ -969,12 +1007,26 @@ export class AccountRunner {
       self.hp !== null && self.maxHp !== null && self.maxHp > 0 ? self.hp / self.maxHp : null;
 
     if (hpFrac !== null && hpFrac <= CRITICAL_HP_FRACTION) {
-      // A fountain is free healing and costs nothing to try.
+      // A fountain is free healing, but it can only be used from its own
+      // interaction cell — the server refuses it silently from anywhere else,
+      // which turned a critical-HP tick into a no-op. Walk there first.
       if (this.fountainReady) {
-        this.note = `critical ${Math.round(hpFrac * 100)}% hp — drinking from the fountain`;
-        room.send(MSG.DUNGEON_FOUNTAIN_USE, {});
-        this.fountainReady = false;
-        return;
+        const at = this.fountainAt;
+        const here = self.pos ? { col: Math.round(self.pos.x), row: Math.round(self.pos.y) } : null;
+        const adjacent =
+          at && here && Math.abs(at.col - here.col) <= 1 && Math.abs(at.row - here.row) <= 1;
+        if (!at || adjacent) {
+          this.note = `critical ${Math.round(hpFrac * 100)}% hp — drinking from the fountain`;
+          room.send(MSG.DUNGEON_FOUNTAIN_USE, {});
+          this.fountainReady = false;
+          return;
+        }
+        if (here && this.stepToward(room, here, at)) {
+          this.note =
+            `critical ${Math.round(hpFrac * 100)}% hp — walking to the fountain ` +
+            `at (${at.col},${at.row})`;
+          return;
+        }
       }
 
       const potion = this.inventory().find(
@@ -1229,15 +1281,36 @@ function optional(r: Record<string, unknown>): Partial<SellableItem> {
   return o;
 }
 
-/** Read a boolean-ish "is it available" flag from a state payload. */
+/**
+ * Read a boolean-ish "is it available" flag from a state payload.
+ *
+ * `exhausted` is checked first and inverted. The real `d.fountain.state`
+ * payload is `{ roomId, interactionCol, interactionRow, active, exhausted,
+ * activeAssetId, usedAssetId }`, and `active` stays true for a fountain that
+ * has already been drained — it describes the object, not its charge. Reading
+ * `active` alone therefore reported a spent fountain as free healing, and the
+ * bot burned its critical-HP tick on a refused use instead of retreating.
+ */
 function readyFlag(payload: unknown): boolean {
   if (!payload || typeof payload !== 'object') return false;
   const r = payload as Record<string, unknown>;
+  if (typeof r.exhausted === 'boolean' && r.exhausted) return false;
   for (const k of ['available', 'ready', 'active', 'charged', 'used']) {
     const v = r[k];
     if (typeof v === 'boolean') return k === 'used' ? !v : v;
   }
   return false;
+}
+
+/** Interaction cell a dungeon prop must be stood next to before it can be used. */
+function readInteractionCell(payload: unknown): Cell | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const r = payload as Record<string, unknown>;
+  const col = r.interactionCol;
+  const row = r.interactionRow;
+  return typeof col === 'number' && typeof row === 'number'
+    ? { col: Math.round(col), row: Math.round(row) }
+    : null;
 }
 
 function safeLabel(payload: unknown): string | null {
